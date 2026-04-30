@@ -18,7 +18,22 @@ import os
 from byteps.common import get_ext_suffix
 
 
+def _set_ucx_env_defaults():
+    if os.environ.get('BYTEPS_WITH_UCX') == '1':
+        os.environ['DMLC_ENABLE_UCX'] = os.environ.get('DMLC_ENABLE_UCX', '1')
+    os.environ['UCX_SOCKADDR_CM_ENABLE'] = os.environ.get('UCX_SOCKADDR_CM_ENABLE', 'y')
+    os.environ['UCX_WARN_UNUSED_ENV_VARS'] = os.environ.get('UCX_WARN_UNUSED_ENV_VARS', 'n')
+    os.environ['UCX_IB_TRAFFIC_CLASS'] = os.environ.get('UCX_IB_TRAFFIC_CLASS', '106')
+    os.environ['PSLITE_UCX_USE_MT_MUTEX'] = os.environ.get('PSLITE_UCX_USE_MT_MUTEX', 'y')
+    os.environ['PSLITE_UCX_RNDV_THRESH'] = os.environ.get(
+        'PSLITE_UCX_RNDV_THRESH', os.environ.get('UCX_RNDV_THRESH', '8k'))
+    os.environ['UCX_RNDV_THRESH'] = os.environ.get(
+        'UCX_RNDV_THRESH', os.environ['PSLITE_UCX_RNDV_THRESH'])
+    os.environ['BYTEPS_UCX_SHORT_THRESH'] = os.environ.get('BYTEPS_UCX_SHORT_THRESH', '0')
+
+
 def run():
+    _set_ucx_env_defaults()
     dll_path = os.path.join(os.path.dirname(__file__),
                             'c_lib' + get_ext_suffix())
     SERVER_LIB_CTYPES = ctypes.CDLL(dll_path, ctypes.RTLD_GLOBAL)

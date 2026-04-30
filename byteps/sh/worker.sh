@@ -20,7 +20,7 @@ export BYTEPS_PARTITION_BYTES=${BYTEPS_PARTITION_BYTES:-1024000}
 
 export BYTEPS_SCHEDULING_CREDIT=${BYTEPS_SCHEDULING_CREDIT:-0}
 
-export DMLC_USE_GDR=${DMLC_USE_GDR:-1}  # GPU Direct RDMA，默认关闭
+export DMLC_USE_GDR=${DMLC_USE_GDR:-0}  # GPU Direct RDMA，默认关闭
 
 extract_primary_hca() {
   local hca="${NCCL_IB_HCA:-}"

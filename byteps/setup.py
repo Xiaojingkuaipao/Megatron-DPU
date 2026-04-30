@@ -242,6 +242,53 @@ def use_ucx():
     byteps_with_ucx = int(os.environ.get('BYTEPS_WITH_UCX', 0))
     return byteps_with_ucx
 
+
+def get_cuda_home():
+    return os.environ.get('BYTEPS_CUDA_HOME', '/usr/local/cuda')
+
+
+def has_cuda_header():
+    return os.path.isfile(os.path.join(get_cuda_home(), 'include', 'cuda_runtime.h'))
+
+
+def ucx_reports_cuda():
+    ucx_info = os.path.join(get_ucx_home(), 'bin', 'ucx_info')
+    if not os.path.isfile(ucx_info):
+        return False
+    try:
+        output = subprocess.check_output([ucx_info, '-v'], stderr=subprocess.STDOUT,
+                                         universal_newlines=True)
+    except Exception:
+        return False
+    return '--with-cuda' in output and '--without-cuda' not in output
+
+
+def use_ucx_cuda():
+    forced = os.environ.get('BYTEPS_UCX_WITH_CUDA')
+    if forced is not None:
+        return int(forced)
+    if int(os.environ.get('BYTEPS_FORCE_NO_CUDA', 0)):
+        return 0
+    if int(os.environ.get('BYTEPS_SERVER_ONLY', 0)):
+        return 0
+    if not has_cuda_header():
+        return 0
+    if should_build_ucx():
+        return 1
+    return int(ucx_reports_cuda())
+
+
+def use_pslite_cuda():
+    forced = os.environ.get('BYTEPS_PSLITE_WITH_CUDA')
+    if forced is not None:
+        return int(forced)
+    return int(use_ucx() and use_ucx_cuda())
+
+
+def server_only():
+    return int(os.environ.get('BYTEPS_SERVER_ONLY', 0))
+
+
 def with_pre_setup():
     return int(os.environ.get('BYTEPS_WITHOUT_PRESETUP', 0)) == 0
 
@@ -331,8 +378,12 @@ def get_common_options(build_ext):
             LIBRARY_DIRS += [f'{ucx_home}/lib']
 
     # ps-lite
-    EXTRA_OBJECTS = ['3rdparty/ps-lite/build/libps.a',
-                     '3rdparty/ps-lite/deps/lib/libzmq.a']
+    if server_only():
+        EXTRA_OBJECTS = ['3rdparty/ps-lite/build/libps.a']
+        LIBRARIES += ['zmq']
+    else:
+        EXTRA_OBJECTS = ['3rdparty/ps-lite/build/libps.a',
+                         '3rdparty/ps-lite/deps/lib/libzmq.a']
 
     return dict(MACROS=MACROS,
                 INCLUDES=INCLUDES,
@@ -375,6 +426,15 @@ def build_server(build_ext, options):
         if ucx_home:
             server_lib.include_dirs += [f'{ucx_home}/include']
             server_lib.library_dirs += [f'{ucx_home}/lib']
+    if server_only():
+        server_lib.libraries += ['zmq']
+    if use_pslite_cuda():
+        cuda_include_dirs, cuda_lib_dirs = get_cuda_dirs(
+            build_ext, options['COMPILE_FLAGS'])
+        server_lib.define_macros += [('HAVE_CUDA', '1')]
+        server_lib.include_dirs += cuda_include_dirs
+        server_lib.library_dirs += cuda_lib_dirs
+        server_lib.libraries += ['cudart']
 
     build_ext.build_extension(server_lib)
 
@@ -895,19 +955,28 @@ def build_ucx():
         if os.path.exists("./ucx.tar.gz"):
             ucx_tarball_path = os.path.join(here, './ucx.tar.gz')
 
-    if not ucx_tarball_path:
-        cmd = "curl -kL {} -o ucx.tar.gz".format("https://github.com/openucx/ucx/archive/refs/tags/v1.11.0.tar.gz")
-        subprocess.run(cmd, shell=True)
-        ucx_tarball_path = os.path.join(here, './ucx.tar.gz')
-
-    print("ucx_tarball_path is", ucx_tarball_path)
     ucx_prefix = get_ucx_prefix()
     sudo_str = "" if os.access(ucx_prefix, os.W_OK) else "sudo"
-    cmd = "mkdir -p tmp; tar xzf {} -C tmp; ".format(ucx_tarball_path) + \
-          "rm -rf ucx-build; mkdir -p ucx-build; mv tmp/ucx-*/* ucx-build/; " + \
+    configure_args = ["--enable-mt", f"--prefix={ucx_prefix}"]
+    if has_rdma_header():
+        configure_args += ["--with-verbs", "--with-mlx5", "--with-rdmacm"]
+    if use_ucx_cuda():
+        configure_args += [f"--with-cuda={get_cuda_home()}"]
+    else:
+        configure_args += ["--without-cuda"]
+    if ucx_tarball_path:
+        print("ucx_tarball_path is", ucx_tarball_path)
+        source_cmd = "mkdir -p tmp; tar xzf {} -C tmp; ".format(ucx_tarball_path) + \
+                     "rm -rf ucx-build; mkdir -p ucx-build; mv tmp/ucx-*/* ucx-build/; "
+    else:
+        ucx_version = os.getenv("BYTEPS_UCX_VERSION", "1.20.0")
+        print("ucx git tag is v{}".format(ucx_version))
+        source_cmd = "rm -rf ucx-build; " + \
+                     "git clone --branch v{0} --depth 1 https://github.com/openucx/ucx.git ucx-build; ".format(ucx_version)
+    cmd = source_cmd + \
           "cd ucx-build; pwd; which libtoolize; " + \
-          "./autogen.sh; ./autogen.sh && " + \
-          "./contrib/configure-release --enable-mt --prefix={0} && make -j && {1} make install -j".format(ucx_prefix, sudo_str)
+          "./autogen.sh; rm -rf build; mkdir build; cd build; " + \
+          "../contrib/configure-release {0} && make -j && {1} make install -j".format(" ".join(configure_args), sudo_str)
     make_process = subprocess.Popen(cmd,
                                     cwd='3rdparty',
                                     stdout=sys.stdout,
@@ -979,6 +1048,8 @@ class custom_build_ext(build_ext):
                 make_option += 'USE_UCX=1 '
                 if ucx_home:
                     make_option += f'UCX_PATH={ucx_home} '
+                if use_pslite_cuda():
+                    make_option += f'USE_CUDA=1 CUDA_HOME={get_cuda_home()} '
 
             if with_pre_setup():
                 make_option += pre_setup.extra_make_option()
@@ -987,7 +1058,8 @@ class custom_build_ext(build_ext):
                 zmq_tarball_path = os.path.join(here, './zeromq-4.1.4.tar.gz')
                 # make_option += " WGET='curl -O '  ZMQ_URL=file://" + zmq_tarball_path + " "
 
-            make_process = subprocess.Popen('make ' + make_option,
+            make_cmd = 'make ps ' + make_option if server_only() else 'make ' + make_option
+            make_process = subprocess.Popen(make_cmd,
                                             cwd='3rdparty/ps-lite',
                                             stdout=sys.stdout,
                                             stderr=sys.stderr,
@@ -1008,6 +1080,10 @@ class custom_build_ext(build_ext):
         except:
             raise DistutilsSetupError('An ERROR occured while building the server module.\n\n'
                                       '%s' % traceback.format_exc())
+
+        if server_only():
+            print('INFO: BYTEPS_SERVER_ONLY=1; server built; skip TF/Torch/MXNet plugins')
+            return
 
         # If PyTorch is installed, it must be imported before others, otherwise
         # we may get an error: dlopen: cannot load any more object with static TLS

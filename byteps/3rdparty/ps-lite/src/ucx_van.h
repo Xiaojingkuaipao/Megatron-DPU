@@ -19,6 +19,7 @@
 #ifdef DMLC_USE_UCX
 
 #include <ucp/api/ucp.h>
+#include <atomic>
 #include <netdb.h>
 #include <queue>
 #include <set>
@@ -238,9 +239,11 @@ public:
     ep_params.err_handler.arg   = this;
     ep_params.conn_request      = conn_request;
     if (errh_enable_) {
-      ep_params.field_mask     |= UCP_EP_PARAM_FIELD_ERR_HANDLER;
+      ep_params.field_mask     |= UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                  UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
       ep_params.err_handler.cb  = ErrorHandlerCb;
       ep_params.err_handler.arg = this;
+      ep_params.err_mode        = UCP_ERR_HANDLING_MODE_PEER;
     }
 
     // This is request for connection establishment from the client side.
@@ -255,6 +258,7 @@ public:
 
   void Cleanup() {
     mu_.lock();
+    closing_.store(true);
     for (auto& it : client_eps_) {
       UCX_LOGE(3, "ep close in cleanup: " << it.first << "|"  << it.second->ep);
       CloseEp(it.second->ep);
@@ -267,17 +271,7 @@ public:
     mu_.unlock();
 
     UCX_LOGE(3, "ep close all, active reqs: " << close_ep_reqs_.size());
-    while (!close_ep_reqs_.empty()) {
-      // There should not be concurrent access to rx_worker, because polling
-      // thread is supposed to be joined already.
-      ucp_worker_progress(rx_worker_);
-      ucp_worker_progress(tx_worker_);
-      ucs_status_t status = ucp_request_check_status(close_ep_reqs_.front());
-      if (status != UCS_INPROGRESS) {
-          ucp_request_free(close_ep_reqs_.front());
-          close_ep_reqs_.pop();
-      }
-    }
+    ProgressCloseRequests();
   }
 
   ucp_ep_h Find(int node_id, int dev_id) {
@@ -291,22 +285,54 @@ public:
   }
  private:
   void CloseEp(ucp_ep_h ep) {
+    if (ep == nullptr) {
+      return;
+    }
+
     void *req = ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FLUSH);
     if (UCS_PTR_IS_PTR(req)) {
       close_ep_reqs_.push(req);
     } else {
       ucs_status_t status = UCS_PTR_STATUS(req);
       if ((status != UCS_OK) && (status != UCS_ERR_ENDPOINT_TIMEOUT)) {
-        LOG(ERROR) << "failed to close ep: " << ep << "("
-                   << ucs_status_string(status) << ")";
+        UCX_LOGE(1, "failed to flush close ep: " << ep << "("
+                 << ucs_status_string(status) << "), try force close");
+        req = ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FORCE);
+        if (UCS_PTR_IS_PTR(req)) {
+          close_ep_reqs_.push(req);
+        } else {
+          status = UCS_PTR_STATUS(req);
+          if ((status != UCS_OK) && (status != UCS_ERR_ENDPOINT_TIMEOUT)) {
+            LOG(ERROR) << "failed to force close ep: " << ep << "("
+                       << ucs_status_string(status) << ")";
+          }
+        }
       }
     }
 
     UCX_LOGE(3, "close ep " << ep << " with req " << req);
   }
 
+  void ProgressCloseRequests() {
+    while (!close_ep_reqs_.empty()) {
+      // There should not be concurrent access to rx_worker, because polling
+      // thread is supposed to be joined already.
+      ucp_worker_progress(rx_worker_);
+      ucp_worker_progress(tx_worker_);
+      ucs_status_t status = ucp_request_check_status(close_ep_reqs_.front());
+      if (status != UCS_INPROGRESS) {
+        ucp_request_free(close_ep_reqs_.front());
+        close_ep_reqs_.pop();
+      }
+    }
+  }
+
   void ErrorHandler(ucp_ep_h ep)
   {
+    if (closing_.load()) {
+      return;
+    }
+
     mu_.lock();
     auto client_check = [ep](const auto &mo) {return mo.second->ep == ep;};
     auto client_it    = std::find_if(client_eps_.begin(), client_eps_.end(),
@@ -436,6 +462,7 @@ public:
   Node                                                 *my_node_;
   int                                                  errh_enable_;
   int                                                  reconnect_tmo_;
+  std::atomic<bool>                                    closing_{false};
 };
 
 // This class:
@@ -614,7 +641,12 @@ public:
   }
 
   void Connect(const Node &node) {
-      ep_pool_.Create(node);
+    if (GetEnv("BYTEPS_UCX_CONNECT_LOG", 1)) {
+      LOG(INFO) << my_node_->ShortDebugString() << " UCX ctx dev="
+                << DeviceTypeName[src_dev_type_] << "[" << src_dev_idx_
+                << "] connect to " << node.DebugString();
+    }
+    ep_pool_.Create(node);
   }
 
   void PinMemory(void *addr, size_t length, bool is_gpu) {
@@ -703,6 +735,7 @@ public:
 
   void Cleanup() {
     ucp_listener_destroy(listener_);
+    ep_pool_.Cleanup();
     ucp_worker_destroy(tx_worker_);
     ucp_worker_destroy(rx_worker_);
     ucp_cleanup(context_);
@@ -910,6 +943,7 @@ class UCXVan : public Van {
     short_send_thresh_   = GetEnv("BYTEPS_UCX_SHORT_THRESH", 4096);
     force_request_order_ = GetEnv("BYTEPS_UCX_FORCE_REQ_ORDER", 0);
     queue_sends_         = GetEnv("BYTEPS_UCX_QUEUE_SENDS", 0);
+    connect_log_         = GetEnv("BYTEPS_UCX_CONNECT_LOG", 1);
     if (!getenv("UCX_USE_MT_MUTEX") && !getenv("PSLITE_UCX_USE_MT_MUTEX")) {
       LOG(FATAL) << "PSLITE_UCX_USE_MT_MUTEX is not set. Please export PSLITE_UCX_USE_MT_MUTEX=y";
     }
@@ -932,6 +966,20 @@ class UCXVan : public Van {
   }
 
  protected:
+  void RequestLocalStop() override {
+    Message exit;
+    exit.meta.control.cmd = Control::TERMINATE;
+    exit.meta.recver = my_node_.id;
+    exit.meta.sender = my_node_.id;
+    exit.meta.customer_id = 0;
+
+    UCXBuffer buff = {};
+    int meta_size;
+    PackMeta(exit.meta, &buff.raw_meta, &meta_size);
+    buff.sender = my_node_.id;
+    rx_pool_->PushOrdered(buff);
+  }
+
   void Start(int customer_id, bool standalone) override {
     start_mu_.lock();
     should_stop_ = false;
@@ -1040,12 +1088,29 @@ class UCXVan : public Van {
     CHECK_NE(node.port, node.kEmpty);
     CHECK(node.hostname.size());
 
+    if (node.id == my_node_.id) {
+      if (connect_log_) {
+        LOG(INFO) << my_node_.ShortDebugString()
+                  << " UCX skip self connection to " << node.DebugString();
+      }
+      return;
+    }
+
     // worker doesn't need to connect to the other workers. same for server
     if ((node.role == my_node_.role) && (node.id != my_node_.id)) {
+      if (connect_log_) {
+        LOG(INFO) << my_node_.ShortDebugString()
+                  << " UCX skip same-role peer " << node.DebugString();
+      }
       return;
     }
 
     // Connect every UCX context to all remote ports (UCX contexts)
+    if (connect_log_) {
+      LOG(INFO) << my_node_.ShortDebugString() << " UCX connect "
+                << contexts_.size() << " local context(s) to remote "
+                << node.DebugString();
+    }
     for (auto& it : contexts_) {
       it.second->Connect(node);
     }
@@ -1378,6 +1443,7 @@ class UCXVan : public Van {
   std::unique_ptr<std::thread>                         reorder_thread_;
   int                                                  force_request_order_;
   int                                                  queue_sends_;
+  int                                                  connect_log_;
   ThreadsafeQueue<UCXTxReq>                            tx_reqs_;
 };  // class UCXVan
 
