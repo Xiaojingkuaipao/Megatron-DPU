@@ -104,16 +104,20 @@ class BytePSCommSocket : public BytePSComm {
     if ((_root == _local_rank) && _listen_thread) {
       _listen_thread->join();
     }
-    close(_send_fd);
-    close(_recv_fd);
+    if (_send_fd >= 0) close(_send_fd);
+    if (_recv_fd >= 0) close(_recv_fd);
 
-    auto fd_path = _send_path + std::to_string(_local_rank);
-    if (!std::remove(fd_path.c_str())) {
-      BPS_LOG(DEBUG) << "Clear socket " << fd_path;
+    if (!_send_path.empty()) {
+      auto fd_path = _send_path + std::to_string(_local_rank);
+      if (!std::remove(fd_path.c_str())) {
+        BPS_LOG(DEBUG) << "Clear socket " << fd_path;
+      }
     }
-    fd_path = _recv_path + std::to_string(_local_rank);
-    if (!std::remove(fd_path.c_str())) {
-      BPS_LOG(DEBUG) << "Clear socket " << fd_path;
+    if (!_recv_path.empty()) {
+      auto fd_path = _recv_path + std::to_string(_local_rank);
+      if (!std::remove(fd_path.c_str())) {
+        BPS_LOG(DEBUG) << "Clear socket " << fd_path;
+      }
     }
 
     BPS_LOG(DEBUG) << "Clear BytePSCommSocket"
@@ -138,12 +142,12 @@ class BytePSCommSocket : public BytePSComm {
   void startListenThread();
   int initSocket(int rank, const std::string& path);
 
-  std::thread* _listen_thread;
+  std::thread* _listen_thread = nullptr;
 
   std::string _send_path;
   std::string _recv_path;
-  int _recv_fd;
-  int _send_fd;
+  int _recv_fd = -1;
+  int _send_fd = -1;
 
   std::mutex _socket_mu;
 };

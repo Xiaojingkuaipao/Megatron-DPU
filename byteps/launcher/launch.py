@@ -198,6 +198,20 @@ def worker(local_rank, local_size, command, allocation=None):
     subprocess.check_call(command, env=my_env,
                           stdout=sys.stdout, stderr=sys.stderr, shell=True)
 
+def get_local_size():
+    explicit_local_size = os.getenv("BYTEPS_LOCAL_SIZE", "").strip()
+    if explicit_local_size:
+        return int(explicit_local_size)
+
+    cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    if cuda_visible_devices and cuda_visible_devices not in ("-1", "none", "void"):
+        return len([dev for dev in cuda_visible_devices.split(",") if dev.strip()])
+
+    if "NVIDIA_VISIBLE_DEVICES" in os.environ:
+        return len(os.environ["NVIDIA_VISIBLE_DEVICES"].split(","))
+
+    return 1
+
 def parse_num_range(core_list):
     # core_list is a colon-seperated string. each section is the physical
     # core assignment for the corresponding byteps worker.
@@ -238,10 +252,7 @@ def launch_bps():
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["UCX_HANDLE_ERRORS"] = os.getenv("UCX_HANDLE_ERRORS", "none")
     if os.environ["DMLC_ROLE"] == "worker":
-        if "NVIDIA_VISIBLE_DEVICES" in os.environ:
-            local_size = len(os.environ["NVIDIA_VISIBLE_DEVICES"].split(","))
-        else:
-            local_size = 1
+        local_size = get_local_size()
         t = [None] * local_size
 
         bind_to_cores = os.getenv("BYTEPS_NUMA_ON", "1") == "1"

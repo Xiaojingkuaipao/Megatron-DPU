@@ -44,6 +44,12 @@ BytePSCommSocket::BytePSCommSocket(std::shared_ptr<BytePSComm> comm,
   _members = (members.size() > 0) ? members : sock_comm->getMembers();
   _root = _members.back();
 
+  if (_members.size() == 1) {
+    BPS_LOG(DEBUG) << "Skip local socket for single-member communicator"
+                   << " (rank=" << _local_rank << ")";
+    return;
+  }
+
   auto my_role = (_local_rank == _root) ? LOCAL_ROOT : LOCAL_WORKER;
   bool is_root = (my_role == LOCAL_ROOT) ? true : false;
   // init socket comm
@@ -95,6 +101,12 @@ void BytePSCommSocket::init(int* rank, int* size, int* local_rank,
 
   *my_role = (_local_rank == _root) ? LOCAL_ROOT : LOCAL_WORKER;
   bool is_root = (*my_role == LOCAL_ROOT) ? true : false;
+
+  if (_local_size == 1) {
+    BPS_LOG(DEBUG) << "Skip local socket for single local rank"
+                   << " (rank=" << _local_rank << ")";
+    return;
+  }
 
   if (getenv("BYTEPS_SOCKET_PATH")) {
     _send_path = std::string(getenv("BYTEPS_SOCKET_PATH")) +
@@ -207,6 +219,7 @@ void BytePSCommSocket::startListenThread() {  // only root starts this in
 }
 
 int BytePSCommSocket::sendSignal(int destination, void* data, int len) {
+  BPS_CHECK_GE(_send_fd, 0) << "local socket is disabled";
   std::lock_guard<std::mutex> lock(_socket_mu);
   struct sockaddr_un destaddr;
   memset(&destaddr, 0, sizeof(destaddr));
@@ -235,6 +248,7 @@ int BytePSCommSocket::sendSignalToRoot(void* data, int len) {
 }
 
 int BytePSCommSocket::recvSignal(int* source, void* data, int max_len) {
+  BPS_CHECK_GE(_recv_fd, 0) << "local socket is disabled";
   int rc;
   while (true) {
     rc = recv(_recv_fd, data, MAX_LINE, MSG_WAITALL);
