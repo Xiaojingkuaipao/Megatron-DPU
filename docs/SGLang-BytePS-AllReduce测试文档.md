@@ -25,15 +25,27 @@
 ```bash
 export SGLANG_REPO=/path/to/sglang
 export MEGATRON_DPU_REPO=/path/to/Megatron-DPU
-export SGLANG_BRANCH=<sglang-branch-or-commit>
-export MEGATRON_DPU_BRANCH=<megatron-dpu-branch-or-commit>
+
+export SGLANG_GIT_URL=https://github.com/Xiaojingkuaipao/sglang.git
+export MEGATRON_DPU_GIT_URL=https://github.com/Xiaojingkuaipao/Megatron-DPU.git
+
+export SGLANG_BRANCH=byteps-v0.5.12-post1
+export MEGATRON_DPU_BRANCH=master
+
+# 当前本地测试对应的精确提交。需要完全复现时用 commit checkout。
+export SGLANG_COMMIT=28dd16214ad9bd000c476c887255a940c5e32d95
+export MEGATRON_DPU_COMMIT=267b4868eb40c6b3af7e4b72ea322f92ccc6ccbf
+
+# tag 信息：当前 HEAD 没有正好落在 tag 上。
+# SGLang 最近 tag: v0.5.12.post1，当前提交描述为 v0.5.12.post1-1-g28dd16214。
+# Megatron-DPU 当前提交未发现对应 tag，当前提交描述为 267b486。
 ```
 
 如果服务器上还没有仓库：
 
 ```bash
-git clone <sglang-git-url> "$SGLANG_REPO"
-git clone <Megatron-DPU-git-url> "$MEGATRON_DPU_REPO"
+git clone "$SGLANG_GIT_URL" "$SGLANG_REPO"
+git clone "$MEGATRON_DPU_GIT_URL" "$MEGATRON_DPU_REPO"
 ```
 
 更新 SGLang 仓库：
@@ -44,6 +56,9 @@ git fetch --all --prune
 git checkout "$SGLANG_BRANCH"
 git pull --ff-only
 git submodule update --init --recursive
+
+# 如果要完全复现当前本地代码，改用：
+# git checkout "$SGLANG_COMMIT"
 ```
 
 更新 Megatron-DPU 仓库：
@@ -54,6 +69,9 @@ git fetch --all --prune
 git checkout "$MEGATRON_DPU_BRANCH"
 git pull --ff-only
 git submodule update --init --recursive
+
+# 如果要完全复现当前本地代码，改用：
+# git checkout "$MEGATRON_DPU_COMMIT"
 ```
 
 如果 checkout 的是具体 commit hash，不需要执行 `git pull --ff-only`，确认 `git rev-parse HEAD` 是目标提交即可。
