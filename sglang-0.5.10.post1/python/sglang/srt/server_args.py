@@ -621,6 +621,8 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    use_byteps_all_reduce: bool = False
+    byteps_all_reduce_debug: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -5408,6 +5410,16 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--use-byteps-all-reduce",
+            action="store_true",
+            help="Use BytePS push/pull for model-path All-Reduce collectives.",
+        )
+        parser.add_argument(
+            "--byteps-all-reduce-debug",
+            action="store_true",
+            help="Log BytePS All-Reduce routing decisions.",
         )
         parser.add_argument(
             "--enable-mscclpp",

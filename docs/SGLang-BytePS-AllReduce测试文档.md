@@ -1,212 +1,299 @@
 # SGLang BytePS All-Reduce 测试文档
 
-本文档按服务器上的实际部署方式编写：**SGLang 和 Megatron-DPU 是两个独立仓库**，SGLang 从 SGLang 仓库安装，BytePS 从 Megatron-DPU 仓库安装；Python 环境使用已有 conda 环境 `sgl-dev2`。
+本文档按当前二合一仓库编写。服务器上只需要一份 `Megatron-DPU` 仓库，BytePS 从 `byteps/` 安装，SGLang 从 `sglang-0.5.10.post1/python/` 安装。
 
-命令里的 `<...>` 按服务器实际情况填写。
+下面命令统一假设服务器代码目录是：
+
+```text
+/home/xzj/Megatron-DPU
+```
+
+如果服务器实际目录不同，直接把命令里的 `/home/xzj/Megatron-DPU` 替换成真实目录。本文不再使用 `SGLANG_REPO`、`MEGATRON_DPU_REPO` 这类路径变量。
 
 ## 1. 测试目标
 
-验证 SGLang 新增的 `--use-byteps-all-reduce` 能把模型主路径 All-Reduce 路由到 Megatron-DPU 仓库里的 BytePS。
+验证 `--use-byteps-all-reduce` 能把 SGLang 模型计算主路径 All-Reduce 路由到本仓库里的 BytePS。
 
 当前第一阶段约束：
 
 - 只替换模型计算主路径 `GroupCoordinator.all_reduce()`。
-- 不替换 scheduler/cache/speculative/disaggregation 等控制面直接 `torch.distributed.all_reduce()`。
+- 不替换 scheduler、cache、speculative 等控制面直接 `torch.distributed.all_reduce()`。
 - 不替换 reduce-scatter、all-gather、broadcast、send/recv。
-- 不支持 `quant_all_reduce()`；触发后会显式报错。
-- 不支持 CUDA graph / piecewise CUDA graph；启动 BytePS 测试时必须加 `--disable-cuda-graph --disable-piecewise-cuda-graph`。
-- 首测只建议单机多 GPU，先用 `--tp-size 2`。
-- 不要用 `bpslaunch` 包 SGLang server，SGLang 自己会启动 model worker。
+- 当前源码没有发现 `quant_all_reduce()` 符号；如果后续路径进入量化 All-Reduce，应先显式报错，不允许 fallback。
+- 不支持 CUDA graph / piecewise CUDA graph；BytePS 测试必须加 `--disable-cuda-graph --disable-piecewise-cuda-graph`。
+- 首测建议单机多 GPU，先用 `--tp-size 2`。
+- 不要用外层 `bpslaunch` 包 SGLang server。SGLang model worker 会在进程内设置 BytePS local rank/local size 并初始化 BytePS。
 
-## 2. 仓库准备
+## 2. 提交并更新服务器代码
 
-设置两个仓库路径：
+本地提交并推送：
 
 ```bash
-export SGLANG_REPO=/path/to/sglang
-export MEGATRON_DPU_REPO=/path/to/Megatron-DPU
-
-export SGLANG_GIT_URL=https://github.com/Xiaojingkuaipao/sglang.git
-export MEGATRON_DPU_GIT_URL=https://github.com/Xiaojingkuaipao/Megatron-DPU.git
-
-export SGLANG_BRANCH=byteps-v0.5.12-post1
-export MEGATRON_DPU_BRANCH=master
-
-# 当前本地测试对应的精确提交。需要完全复现时用 commit checkout。
-export SGLANG_COMMIT=28dd16214ad9bd000c476c887255a940c5e32d95
-export MEGATRON_DPU_COMMIT=267b4868eb40c6b3af7e4b72ea322f92ccc6ccbf
-
-# tag 信息：当前 HEAD 没有正好落在 tag 上。
-# SGLang 最近 tag: v0.5.12.post1，当前提交描述为 v0.5.12.post1-1-g28dd16214。
-# Megatron-DPU 当前提交未发现对应 tag，当前提交描述为 267b486。
+cd /Users/zhijingxin/Megatron-DPU
+git status --short
+git add docs/SGLang-BytePS-AllReduce实现说明.md \
+  docs/SGLang-BytePS-AllReduce测试文档.md \
+  sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
+  sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
+  sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
+  sglang-0.5.10.post1/python/sglang/srt/layers/linear.py \
+  sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py \
+  sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py \
+  sglang-0.5.10.post1/python/sglang/srt/server_args.py
+git commit -m "Add SGLang BytePS all-reduce path"
+git push
 ```
 
-如果服务器上还没有仓库：
+服务器如果还没有仓库：
 
 ```bash
-git clone "$SGLANG_GIT_URL" "$SGLANG_REPO"
-git clone "$MEGATRON_DPU_GIT_URL" "$MEGATRON_DPU_REPO"
+git clone <Megatron-DPU-git-url> /home/xzj/Megatron-DPU
+cd /home/xzj/Megatron-DPU
+git checkout <包含本次修改的分支>
 ```
 
-更新 SGLang 仓库：
+服务器如果已经有仓库：
 
 ```bash
-cd "$SGLANG_REPO"
+cd /home/xzj/Megatron-DPU
 git fetch --all --prune
-git checkout "$SGLANG_BRANCH"
+git checkout <包含本次修改的分支>
 git pull --ff-only
+```
+
+确认服务器代码包含本次修改：
+
+```bash
+cd /home/xzj/Megatron-DPU
+test -f /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py
+grep -R "use-byteps-all-reduce" -n /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py
+grep -R "set_byteps_all_reduce" -n /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py
+```
+
+BytePS 依赖 `3rdparty/ps-lite`。如果服务器上这个目录不完整，先补齐：
+
+```bash
+cd /home/xzj/Megatron-DPU/byteps
 git submodule update --init --recursive
-
-# 如果要完全复现当前本地代码，改用：
-# git checkout "$SGLANG_COMMIT"
+test -d /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite/src
 ```
 
-更新 Megatron-DPU 仓库：
+如果上面的 submodule 命令不能识别 `ps-lite`，用下面的兜底方式：
 
 ```bash
-cd "$MEGATRON_DPU_REPO"
-git fetch --all --prune
-git checkout "$MEGATRON_DPU_BRANCH"
-git pull --ff-only
-git submodule update --init --recursive
-
-# 如果要完全复现当前本地代码，改用：
-# git checkout "$MEGATRON_DPU_COMMIT"
+rm -rf /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite
+git clone -b byteps https://github.com/bytedance/ps-lite /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite
 ```
 
-如果 checkout 的是具体 commit hash，不需要执行 `git pull --ff-only`，确认 `git rev-parse HEAD` 是目标提交即可。
+## 3. 进入 Python 环境
 
-确认 SGLang 仓库里包含 BytePS All-Reduce 代码：
-
-```bash
-cd "$SGLANG_REPO"
-test -f python/sglang/srt/distributed/byteps_collectives.py
-grep -R "use-byteps-all-reduce" -n python/sglang/srt/server_args.py
-```
-
-确认 Megatron-DPU 仓库里有 BytePS：
-
-```bash
-cd "$MEGATRON_DPU_REPO"
-test -f byteps/setup.py
-```
-
-## 3. 安装
-
-进入已有 conda 环境：
+服务器使用已有 conda 环境 `sgl-dev2`，Python 版本为 3.11。
 
 ```bash
 conda activate sgl-dev2
+python --version
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-安装 SGLang：
+建议先确认 PyTorch 和 CUDA 可用：
 
 ```bash
-cd "$SGLANG_REPO"
-python -m pip install -e "python"
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("cuda device count:", torch.cuda.device_count())
+PY
 ```
 
-安装 Megatron-DPU 里的 BytePS。先用普通 TCP/本机路径测试：
+`--tp-size 2` 至少需要当前环境可见 2 张 GPU。
+
+## 4. 更新并安装 BytePS
+
+每次服务器拉取了新的 BytePS 代码后，都建议重新安装 BytePS，避免 Python 环境里残留旧扩展。
+
+先卸载旧包并清理构建产物：
 
 ```bash
-cd "$MEGATRON_DPU_REPO/byteps"
+conda activate sgl-dev2
+python -m pip uninstall -y byteps
+rm -rf /home/xzj/Megatron-DPU/byteps/build
+rm -rf /home/xzj/Megatron-DPU/byteps/dist
+rm -rf /home/xzj/Megatron-DPU/byteps/byteps.egg-info
+```
+
+安装普通 TCP/本机测试版。首测建议先用这个，不要一开始就引入 RDMA/UCX：
+
+```bash
+conda activate sgl-dev2
+cd /home/xzj/Megatron-DPU/byteps
+BYTEPS_WITHOUT_TENSORFLOW=1 \
+BYTEPS_WITHOUT_MXNET=1 \
+BYTEPS_WITH_PYTORCH=1 \
 python setup.py install
 ```
 
-如果要测 RDMA/UCX，再重新编译安装：
+如果服务器 NCCL 不在默认路径，安装前加上真实 NCCL 目录，例如：
 
 ```bash
-cd "$MEGATRON_DPU_REPO/byteps"
-BYTEPS_WITH_UCX=1 python setup.py install
+export BYTEPS_NCCL_HOME=/usr/local/nccl
 ```
 
-如果服务器 NCCL 不在默认路径，安装 BytePS 前先设置：
+如果普通 TCP 路径已经验证通过，再安装 RDMA/UCX 版本：
 
 ```bash
-export BYTEPS_NCCL_HOME=/path/to/nccl
+conda activate sgl-dev2
+python -m pip uninstall -y byteps
+rm -rf /home/xzj/Megatron-DPU/byteps/build
+rm -rf /home/xzj/Megatron-DPU/byteps/dist
+rm -rf /home/xzj/Megatron-DPU/byteps/byteps.egg-info
+cd /home/xzj/Megatron-DPU/byteps
+BYTEPS_WITH_UCX=1 \
+BYTEPS_WITHOUT_TENSORFLOW=1 \
+BYTEPS_WITHOUT_MXNET=1 \
+BYTEPS_WITH_PYTORCH=1 \
+python setup.py install
 ```
 
-## 4. 安装检查
-
-基础导入检查：
+BytePS 安装检查：
 
 ```bash
 conda activate sgl-dev2
 python - <<'PY'
-import torch
-import sglang
 import byteps.torch as bps
-from sglang.srt.distributed.byteps_collectives import initialize_byteps_for_sglang
-
-print("torch:", torch.__version__)
-print("cuda available:", torch.cuda.is_available())
-print("sglang import ok")
+from byteps.torch import ops as bps_ops
 print("byteps import ok")
-print("sglang byteps wrapper import ok")
+print("byteps module:", bps.__file__)
+print("byteps ops import ok")
+PY
+```
+
+可选做一个单进程 BytePS init smoke test。这里用 `timeout` 防止环境变量不匹配时一直卡住：
+
+```bash
+conda activate sgl-dev2
+DMLC_ROLE=worker \
+DMLC_NUM_WORKER=1 \
+DMLC_NUM_SERVER=0 \
+DMLC_WORKER_ID=0 \
+BYTEPS_LOCAL_RANK=0 \
+BYTEPS_LOCAL_SIZE=1 \
+timeout 30s python - <<'PY'
+import byteps.torch as bps
+bps.init()
+print("rank:", bps.rank())
+print("size:", bps.size())
+print("local_rank:", bps.local_rank())
+print("local_size:", bps.local_size())
+bps.shutdown()
+PY
+```
+
+如果这个 smoke test 因 `DMLC_NUM_SERVER`、scheduler 或 server 相关环境报错，不要用 `bpslaunch` 包裹 SGLang server，先继续按后文 SGLang 启动方式测试；必要时再使用“外部 BytePS scheduler/server 兜底模式”。
+
+## 5. 安装 SGLang
+
+从同一个二合一仓库安装 SGLang：
+
+```bash
+conda activate sgl-dev2
+cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+python -m pip install -e "python"
+```
+
+确认安装的是当前仓库里的 SGLang：
+
+```bash
+conda activate sgl-dev2
+python - <<'PY'
+import sglang
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.distributed.byteps_collectives import initialize_byteps_for_sglang
+print("sglang import ok")
+print("sglang module:", sglang.__file__)
+print("use_byteps_all_reduce default:", ServerArgs.use_byteps_all_reduce)
+print("byteps wrapper import ok")
 PY
 ```
 
 语法检查：
 
 ```bash
-cd "$SGLANG_REPO"
-env PYTHONPYCACHEPREFIX=/tmp/sglang_byteps_pycache python -m py_compile \
-  python/sglang/srt/distributed/byteps_collectives.py \
-  python/sglang/srt/server_args.py \
-  python/sglang/srt/model_executor/model_runner.py \
-  python/sglang/srt/distributed/parallel_state.py \
-  python/sglang/srt/distributed/communication_op.py \
-  python/sglang/srt/layers/linear.py \
-  python/sglang/srt/layers/vocab_parallel_embedding.py
+conda activate sgl-dev2
+PYTHONPYCACHEPREFIX=/tmp/sglang-byteps-pycache python -m py_compile \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/linear.py \
+  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py
 ```
 
-## 5. 启动 BytePS 版 SGLang
+## 6. 启动 BytePS 版 SGLang
 
-首测不需要单独启动 BytePS scheduler/server。当前 SGLang 代码会在 model worker 内部设置 BytePS local env：
+首测使用 2 张 GPU。下面示例模型路径是 `/data/models/Qwen2.5-0.5B-Instruct`，测试时替换成服务器真实模型目录。
 
-```text
-BYTEPS_LOCAL_RANK=<gpu_id>
-BYTEPS_LOCAL_SIZE=<tp_size * pp_size>
-DMLC_ROLE=worker
-DMLC_WORKER_ID=0
-DMLC_NUM_WORKER=1
-DMLC_NUM_SERVER=0
-```
-
-推荐首测环境变量：
+启动前先设置环境。不要手动设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`，这两个值由 SGLang model worker 内部按 `gpu_id` 和 `tp_size * pp_size` 设置。
 
 ```bash
 conda activate sgl-dev2
+unset BYTEPS_LOCAL_RANK
+unset BYTEPS_LOCAL_SIZE
+export DMLC_ROLE=worker
+export DMLC_NUM_WORKER=1
+export DMLC_NUM_SERVER=0
+export DMLC_WORKER_ID=0
 export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
 ```
 
-启动服务：
+启动 BytePS All-Reduce 服务：
 
 ```bash
-cd "$SGLANG_REPO"
-python -m sglang.srt.entrypoints.http_server \
-  --model-path <model-path> \
+conda activate sgl-dev2
+cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
+  --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
   --host 127.0.0.1 \
   --port 30000 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
+  --enforce-disable-flashinfer-allreduce-fusion \
   --use-byteps-all-reduce \
   --byteps-all-reduce-debug
 ```
 
-期望日志里能看到：
+期望日志：
 
 - `BytePS initialized for SGLang`
-- `Routing All-Reduce to BytePS`
-- `BytePS All-Reduce completed`
+- `Declared BytePS tensor name=...`
+- 如果日志级别允许 debug，还会看到 `Routing all_reduce through BytePS`
 
-## 6. 请求验证
+如果启动时报 CUDA graph 或 piecewise CUDA graph 相关错误，确认命令里已经包含：
+
+```text
+--disable-cuda-graph
+--disable-piecewise-cuda-graph
+```
+
+如果启动时报 FlashInfer/AITER all-reduce fusion 与 BytePS 不兼容，确认命令里包含：
+
+```text
+--enforce-disable-flashinfer-allreduce-fusion
+```
+
+并且不要添加：
+
+```text
+--enable-aiter-allreduce-fusion
+```
+
+## 7. 请求验证
 
 请求 BytePS 服务：
 
@@ -218,24 +305,29 @@ curl http://127.0.0.1:30000/generate \
 
 通过标准：
 
-- 请求成功返回。
-- 日志中出现 BytePS All-Reduce 路由信息。
-- 无 hang、shape mismatch、tensor name mismatch、group size mismatch。
+- 请求能正常返回。
+- 日志中出现 BytePS 初始化和 declare 信息。
+- 没有 hang。
+- 没有 tensor name mismatch。
+- 没有 group size mismatch。
+- 没有 fallback 到 custom All-Reduce、PyNccl、MSCCLPP、TorchSymmMem 或 `torch.distributed` 的报错。
 
-## 7. NCCL baseline 对照
+## 8. NCCL baseline 对照
 
-另起一个不用 BytePS 的 baseline 服务：
+停止 30000 端口上的 BytePS 服务后，启动不带 BytePS 的 baseline。baseline 仍关闭 custom All-Reduce 和 CUDA graph，减少变量。
 
 ```bash
-cd "$SGLANG_REPO"
-python -m sglang.srt.entrypoints.http_server \
-  --model-path <model-path> \
+conda activate sgl-dev2
+cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
+  --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
   --host 127.0.0.1 \
   --port 30001 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
-  --disable-piecewise-cuda-graph
+  --disable-piecewise-cuda-graph \
+  --enforce-disable-flashinfer-allreduce-fusion
 ```
 
 请求 baseline：
@@ -246,89 +338,156 @@ curl http://127.0.0.1:30001/generate \
   -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":16}}'
 ```
 
-对比：
+对比要点：
 
-- BytePS 和 baseline 都能正常返回。
-- `temperature=0` 下输出 token 基本一致，或只存在停止符差异。
-- BytePS 日志确认主路径 All-Reduce 没有走 NCCL/custom fallback。
+- BytePS 服务和 baseline 服务都能返回。
+- `temperature=0` 下输出应基本一致，允许停止符或截断位置有小差异。
+- BytePS 服务日志中能确认主路径 All-Reduce 走了 BytePS declare/push-pull。
 
-## 8. 常见问题
+## 9. BytePS 参数扫测
 
-`ModuleNotFoundError: No module named 'byteps'`：
-只安装 SGLang 不会安装 BytePS。进入 `$MEGATRON_DPU_REPO/byteps` 执行 `python setup.py install`。
+正确性跑通后再扫参数。每次改环境变量后重启 SGLang 服务。
 
-找不到 `--use-byteps-all-reduce`：
-当前安装的不是包含 BytePS 修改的 SGLang 仓库或分支。检查 `$SGLANG_REPO/python/sglang/srt/server_args.py`。
+```bash
+export BYTEPS_PUSH_THREAD=1
+```
 
-CUDA graph 报错：
-这是预期行为。BytePS phase 1 必须加 `--disable-cuda-graph --disable-piecewise-cuda-graph`。
+```bash
+export BYTEPS_PUSH_THREAD=2
+```
 
-`quant_all_reduce()` 报错：
-这是预期行为。BytePS phase 1 不支持量化通信路径，首测关闭量化通信相关参数。
+```bash
+export BYTEPS_PUSH_THREAD=4
+```
 
-BytePS local rank/local size mismatch：
-检查 `--tp-size`、`CUDA_VISIBLE_DEVICES`、实际 GPU 数，以及是否手动设置了 `BYTEPS_LOCAL_RANK` 或 `BYTEPS_LOCAL_SIZE` 覆盖了 SGLang 内部设置。
+```bash
+export BYTEPS_PARTITION_BYTES=4096000
+```
 
-All-Reduce hang：
-先保持 `DMLC_ENABLE_RDMA=0` 用 TCP/本机路径测试；确认普通 TP 路径正常后，再考虑 RDMA 和外部 scheduler/server。
+```bash
+export BYTEPS_KEY_HASH_FN=raw
+```
 
-RDMA 连接失败：
-先回退 `DMLC_ENABLE_RDMA=0`。如果 TCP 正常，再检查 `DMLC_INTERFACE`、网卡、端口、防火墙、UCX/RDMA runtime，并确认 BytePS 是用 `BYTEPS_WITH_UCX=1` 编译的。
+如果要切到 RDMA/UCX：
 
-## 9. 可选：外部 BytePS scheduler/server
+```bash
+export DMLC_ENABLE_RDMA=1
+```
 
-首测不建议使用这一模式。只有需要验证 BytePS 分布式 scheduler/server 路径时再用。
+RDMA/UCX 出问题时，先回退：
 
-公共环境：
+```bash
+export DMLC_ENABLE_RDMA=0
+```
+
+## 10. 外部 BytePS scheduler/server 兜底模式
+
+首测不建议使用这一模式。只有当 `DMLC_NUM_SERVER=0` 的本机模式在当前 BytePS 构建中不可用，或需要验证 BytePS scheduler/server 链路时再用。
+
+注意：即使使用外部 scheduler/server，也不要用 `bpslaunch` 包裹 SGLang server。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang...` 启动。
+
+终端 1，启动 scheduler：
 
 ```bash
 conda activate sgl-dev2
 export DMLC_NUM_WORKER=1
 export DMLC_NUM_SERVER=1
-export DMLC_PS_ROOT_URI=<scheduler_ip>
+export DMLC_PS_ROOT_URI=127.0.0.1
 export DMLC_PS_ROOT_PORT=9000
 export BYTEPS_FORCE_DISTRIBUTED=1
 export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
-```
-
-终端 1：
-
-```bash
-conda activate sgl-dev2
-# 先执行上面的公共环境 export
 export DMLC_ROLE=scheduler
 bpslaunch
 ```
 
-终端 2：
+终端 2，启动 server：
 
 ```bash
 conda activate sgl-dev2
-# 先执行上面的公共环境 export
+export DMLC_NUM_WORKER=1
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
+export BYTEPS_FORCE_DISTRIBUTED=1
+export BYTEPS_KEY_HASH_FN=raw
+export BYTEPS_PUSH_THREAD=1
+export BYTEPS_LOG_LEVEL=INFO
+export DMLC_ENABLE_RDMA=0
 export DMLC_ROLE=server
 bpslaunch
 ```
 
-终端 3 启动 SGLang，不要用 `bpslaunch` 包裹：
+终端 3，启动 SGLang worker。这里仍然不要设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`：
 
 ```bash
 conda activate sgl-dev2
-# 先执行上面的公共环境 export
+unset BYTEPS_LOCAL_RANK
+unset BYTEPS_LOCAL_SIZE
+export DMLC_NUM_WORKER=1
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
+export BYTEPS_FORCE_DISTRIBUTED=1
+export BYTEPS_KEY_HASH_FN=raw
+export BYTEPS_PUSH_THREAD=1
+export BYTEPS_LOG_LEVEL=INFO
+export DMLC_ENABLE_RDMA=0
 export DMLC_ROLE=worker
 export DMLC_WORKER_ID=0
 
-cd "$SGLANG_REPO"
-python -m sglang.srt.entrypoints.http_server \
-  --model-path <model-path> \
+cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
+  --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
   --host 127.0.0.1 \
   --port 30000 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
+  --enforce-disable-flashinfer-allreduce-fusion \
   --use-byteps-all-reduce \
   --byteps-all-reduce-debug
 ```
+
+## 11. 常见问题
+
+`ModuleNotFoundError: No module named 'byteps'`：
+进入 `/home/xzj/Megatron-DPU/byteps`，在 `sgl-dev2` 环境中重新执行 `python setup.py install`。
+
+找不到 `--use-byteps-all-reduce`：
+服务器安装的不是当前仓库里的 SGLang。检查 `python -c "import sglang; print(sglang.__file__)"`，并重新执行 `python -m pip install -e "python"`。
+
+`Missing ./3rdparty/ps-lite`：
+进入 `/home/xzj/Megatron-DPU/byteps`，执行 `git submodule update --init --recursive`。如果仍不行，按第 2 节兜底方式 clone `ps-lite`。
+
+CUDA graph 报错：
+这是预期保护。BytePS phase 1 必须禁用 CUDA graph 和 piecewise CUDA graph。
+
+FlashInfer/AITER all-reduce fusion 报错：
+BytePS phase 1 不支持 fused All-Reduce + RMSNorm。添加 `--enforce-disable-flashinfer-allreduce-fusion`，并确认没有使用 `--enable-aiter-allreduce-fusion`。
+
+BytePS local rank/local size mismatch：
+通常是外部手动设置了 `BYTEPS_LOCAL_RANK` 或 `BYTEPS_LOCAL_SIZE`。启动 SGLang 前执行：
+
+```bash
+unset BYTEPS_LOCAL_RANK
+unset BYTEPS_LOCAL_SIZE
+```
+
+All-Reduce hang：
+先用 `DMLC_ENABLE_RDMA=0` 和 `BYTEPS_PUSH_THREAD=1` 跑 TCP/本机路径。确认普通路径正常后，再测试 RDMA/UCX。
+
+RDMA 连接失败：
+先回退 `DMLC_ENABLE_RDMA=0`。如果 TCP 正常，再检查网卡、端口、防火墙、UCX/RDMA runtime，并确认 BytePS 是用 `BYTEPS_WITH_UCX=1` 编译安装的。
+
+`DMLC_NUM_SERVER` 相关错误：
+当前 SGLang wrapper 会设置 `DMLC_ROLE`、`DMLC_NUM_WORKER`、`DMLC_WORKER_ID` 的默认值，但不会设置 `DMLC_NUM_SERVER`。首测建议在启动 SGLang 前显式设置：
+
+```bash
+export DMLC_NUM_SERVER=0
+```
+
+如果当前 BytePS 构建不接受 `DMLC_NUM_SERVER=0`，使用第 10 节的外部 scheduler/server 兜底模式。

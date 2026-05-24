@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+import itertools
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -8,6 +9,7 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -20,7 +22,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_allocation_symmetric,
@@ -47,6 +48,8 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
+
+_BYTEPS_VOCAB_PARALLEL_NAME_COUNTER = itertools.count()
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -216,6 +219,14 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        self.byteps_all_reduce_name = (
+            f"vocab_parallel_embedding.{prefix}"
+            if prefix
+            else (
+                "vocab_parallel_embedding.unnamed_"
+                f"{next(_BYTEPS_VOCAB_PARALLEL_NAME_COUNTER)}"
+            )
+        )
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_attention_tp_rank()
@@ -493,10 +504,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             if not get_attn_tp_context().input_scattered:
                 if self.use_attn_tp_group:
-                    output_parallel = attn_tp_all_reduce(output_parallel)
+                    output_parallel = attention_tensor_model_parallel_all_reduce(
+                        output_parallel,
+                        logical_name=self.byteps_all_reduce_name,
+                    )
                 else:
                     # Reduce across all the model parallel GPUs.
-                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+                    output_parallel = tensor_model_parallel_all_reduce(
+                        output_parallel,
+                        logical_name=self.byteps_all_reduce_name,
+                    )
         return output_parallel
 
     def extra_repr(self) -> str:

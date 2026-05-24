@@ -69,6 +69,38 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+_ENABLE_BYTEPS_ALL_REDUCE = False
+_ENABLE_BYTEPS_ALL_REDUCE_DEBUG = False
+
+
+def set_byteps_all_reduce(enable: bool, debug: bool = False):
+    global _ENABLE_BYTEPS_ALL_REDUCE, _ENABLE_BYTEPS_ALL_REDUCE_DEBUG
+    _ENABLE_BYTEPS_ALL_REDUCE = enable
+    _ENABLE_BYTEPS_ALL_REDUCE_DEBUG = debug
+
+
+def _byteps_all_reduce_error(reason: str) -> RuntimeError:
+    return RuntimeError(
+        "--use-byteps-all-reduce is enabled, so model-path All-Reduce must use "
+        f"BytePS and cannot fallback to SGLang/NCCL/custom All-Reduce. {reason}"
+    )
+
+
+def _is_current_cuda_graph_capture(input_: torch.Tensor) -> bool:
+    if not input_.is_cuda or not hasattr(torch, "cuda"):
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _byteps_logical_name(input_: torch.Tensor, logical_name: Optional[str]) -> str:
+    if logical_name:
+        return logical_name
+    shape = "x".join(str(dim) for dim in input_.shape)
+    return f"generic.{input_.dtype}.{shape}"
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -484,6 +516,12 @@ class GroupCoordinator:
         graph_capture_context: Optional[GraphCaptureContext] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ):
+        if _ENABLE_BYTEPS_ALL_REDUCE:
+            raise _byteps_all_reduce_error(
+                "CUDA graph capture was requested. Disable CUDA graph with "
+                "--disable-cuda-graph before using BytePS All-Reduce."
+            )
+
         if graph_capture_context is None:
             if stream is None:
                 stream = self.device_module.Stream()
@@ -541,7 +579,9 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(
+        self, input_: torch.Tensor, logical_name: Optional[str] = None
+    ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -559,6 +599,79 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+
+        if _ENABLE_BYTEPS_ALL_REDUCE:
+            if input_.is_cpu:
+                raise _byteps_all_reduce_error(
+                    "Received a CPU tensor; CPU/shared-memory all-reduce is outside "
+                    "the BytePS phase-1 scope. Disable --use-byteps-all-reduce for "
+                    "this path."
+                )
+            if (
+                self.hpu_communicator is not None
+                and not self.hpu_communicator.disabled
+            ):
+                raise _byteps_all_reduce_error(
+                    "The HPU communicator path is active; BytePS phase 1 only "
+                    "supports CUDA tensors."
+                )
+            if (
+                self.xpu_communicator is not None
+                and not self.xpu_communicator.disabled
+            ):
+                raise _byteps_all_reduce_error(
+                    "The XPU communicator path is active; BytePS phase 1 only "
+                    "supports CUDA tensors."
+                )
+            if (
+                self.npu_communicator is not None
+                and not self.npu_communicator.disabled
+            ):
+                raise _byteps_all_reduce_error(
+                    "The NPU communicator path is active; BytePS phase 1 only "
+                    "supports CUDA tensors."
+                )
+            if self.is_symmetric_memory_enabled():
+                raise _byteps_all_reduce_error(
+                    "Symmetric-memory all-reduce is active. Disable symmetric "
+                    "memory/TorchSymmMem before using --use-byteps-all-reduce."
+                )
+            if is_in_piecewise_cuda_graph():
+                raise _byteps_all_reduce_error(
+                    "Piecewise CUDA graph capture is active. Disable piecewise "
+                    "CUDA graph with --disable-piecewise-cuda-graph."
+                )
+            if _is_current_cuda_graph_capture(input_):
+                raise _byteps_all_reduce_error(
+                    "CUDA graph capture is active. Disable CUDA graph with "
+                    "--disable-cuda-graph before using BytePS All-Reduce."
+                )
+            if not input_.is_cuda:
+                raise _byteps_all_reduce_error(
+                    f"Received a non-CUDA tensor on device {input_.device}; BytePS "
+                    "phase 1 only supports CUDA tensors."
+                )
+            if not input_.is_contiguous():
+                raise _byteps_all_reduce_error(
+                    "Received a non-contiguous tensor; make the tensor contiguous "
+                    "before entering the BytePS All-Reduce path."
+                )
+
+            from sglang.srt.distributed.byteps_collectives import (
+                byteps_allreduce_inplace,
+            )
+
+            name = _byteps_logical_name(input_, logical_name)
+            if _ENABLE_BYTEPS_ALL_REDUCE_DEBUG:
+                logger.debug(
+                    "Routing all_reduce through BytePS: "
+                    "group=%s name=%s shape=%s dtype=%s",
+                    self.unique_name,
+                    name,
+                    tuple(input_.shape),
+                    input_.dtype,
+                )
+            return byteps_allreduce_inplace(input_, self, name)
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
@@ -627,6 +740,13 @@ class GroupCoordinator:
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        if _ENABLE_BYTEPS_ALL_REDUCE:
+            raise _byteps_all_reduce_error(
+                "Fused All-Reduce + RMSNorm is not supported by the BytePS phase-1 "
+                "path. Disable all-reduce fusion before using "
+                "--use-byteps-all-reduce."
+            )
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -675,6 +795,12 @@ class GroupCoordinator:
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        if _ENABLE_BYTEPS_ALL_REDUCE:
+            raise _byteps_all_reduce_error(
+                f"Attempted the {outplace_all_reduce_method} out-of-place "
+                "All-Reduce path instead of BytePS."
+            )
+
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
@@ -700,6 +826,12 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        if _ENABLE_BYTEPS_ALL_REDUCE:
+            raise _byteps_all_reduce_error(
+                "Attempted the in-place PyNccl/TorchSymmMem/torch.distributed "
+                "All-Reduce path instead of BytePS."
+            )
+
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:

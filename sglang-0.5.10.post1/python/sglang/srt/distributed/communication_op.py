@@ -13,9 +13,11 @@ from .parallel_state import (
 )
 
 
-def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def tensor_model_parallel_all_reduce(
+    input_: torch.Tensor, logical_name: Optional[str] = None
+) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    return get_tp_group().all_reduce(input_, logical_name=logical_name)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -55,16 +57,22 @@ def broadcast_tensor_dict(
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
 
 
-def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def attention_tensor_model_parallel_all_reduce(
+    input_: torch.Tensor, logical_name: Optional[str] = None
+) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    return get_attn_tp_group().all_reduce(input_, logical_name=logical_name)
 
 
-def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def moe_tensor_model_parallel_all_reduce(
+    input_: torch.Tensor, logical_name: Optional[str] = None
+) -> torch.Tensor:
     """All-reduce the input tensor across moe parallel group."""
-    return get_moe_tp_group().all_reduce(input_)
+    return get_moe_tp_group().all_reduce(input_, logical_name=logical_name)
 
 
-def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def moe_expert_parallel_all_reduce(
+    input_: torch.Tensor, logical_name: Optional[str] = None
+) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group."""
-    return get_moe_ep_group().all_reduce(input_)
+    return get_moe_ep_group().all_reduce(input_, logical_name=logical_name)

@@ -65,6 +65,7 @@ from sglang.srt.distributed import (
     get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
+    set_byteps_all_reduce,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
@@ -931,6 +932,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_byteps_all_reduce(False)
+
+        if self.server_args.use_byteps_all_reduce:
+            if (
+                self.server_args.enable_flashinfer_allreduce_fusion
+                or self.server_args.enable_aiter_allreduce_fusion
+            ):
+                raise RuntimeError(
+                    "--use-byteps-all-reduce does not support all-reduce fusion "
+                    "paths in phase 1. Disable flashinfer/AITER all-reduce fusion "
+                    "before enabling BytePS All-Reduce."
+                )
+            os.environ.setdefault("BYTEPS_LOCAL_RANK", str(self.gpu_id))
+            os.environ.setdefault(
+                "BYTEPS_LOCAL_SIZE", str(self.tp_size * self.pp_size)
+            )
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -970,6 +987,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
+            if self.server_args.use_byteps_all_reduce:
+                from sglang.srt.distributed.byteps_collectives import (
+                    initialize_byteps_for_sglang,
+                )
+
+                initialize_byteps_for_sglang(
+                    local_rank=self.gpu_id,
+                    local_size=self.tp_size * self.pp_size,
+                    debug=self.server_args.byteps_all_reduce_debug,
+                )
+                set_byteps_all_reduce(
+                    True,
+                    debug=self.server_args.byteps_all_reduce_debug,
+                )
             initialize_dp_attention(
                 server_args=self.server_args,
                 model_config=self.model_config,
@@ -979,8 +1010,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-            if self.server_args.pre_warm_nccl and (
-                self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
+            if (
+                self.server_args.pre_warm_nccl
+                and not self.server_args.use_byteps_all_reduce
+                and (
+                    self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
+                )
             ):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
