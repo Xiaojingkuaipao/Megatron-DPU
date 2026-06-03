@@ -247,6 +247,76 @@ local_size: 1
 
 如果没有拉取包含 `byteps/byteps/common/operations.cc` 修复的代码，`DMLC_USE_GDR` 未设置时可能出现 `basic_string::_M_construct null not valid`。临时绕过方式是在 scheduler、server、worker 环境中都显式设置 `DMLC_USE_GDR=0`；拉取修复后，未设置时默认也按 `0` 处理。
 
+可选再做一个单机双 rank `float16 push_pull` smoke test。注意这里 `expected_workers=1`，因为 BytePS server 等待的是 worker 节点数；单机两个本地 rank 只有一个 local root 会向 server push。如果误写成 `expected_workers=2`，会卡在 `push_pull_async_inplace + synchronize`。
+
+```bash
+cat > /tmp/byteps_tp2_pushpull.py <<'PY'
+import os
+import multiprocessing as mp
+
+
+def run(local_rank):
+    os.environ["DMLC_ROLE"] = "worker"
+    os.environ["DMLC_NUM_WORKER"] = "1"
+    os.environ["DMLC_NUM_SERVER"] = "1"
+    os.environ["DMLC_PS_ROOT_URI"] = "127.0.0.1"
+    os.environ["DMLC_PS_ROOT_PORT"] = "9000"
+    os.environ["DMLC_WORKER_ID"] = "0"
+    os.environ["DMLC_ENABLE_RDMA"] = "0"
+    os.environ["DMLC_USE_GDR"] = "0"
+    os.environ["DMLC_INTERFACE"] = "lo"
+    os.environ["DMLC_NODE_HOST"] = "127.0.0.1"
+    os.environ["BYTEPS_FORCE_DISTRIBUTED"] = "1"
+    os.environ["BYTEPS_KEY_HASH_FN"] = "raw"
+    os.environ["BYTEPS_PUSH_THREAD"] = "1"
+    os.environ["BYTEPS_SOCKET_PATH"] = "/tmp/byteps_socket"
+    os.environ["BYTEPS_LOCAL_RANK"] = str(local_rank)
+    os.environ["BYTEPS_LOCAL_SIZE"] = "2"
+
+    import torch
+    import byteps.torch as bps
+    from byteps.torch import ops as bps_ops
+
+    torch.cuda.set_device(local_rank)
+    bps.init()
+    print("init", local_rank, "rank", bps.rank(), "size", bps.size(), flush=True)
+
+    x = torch.full((8,), local_rank + 1, device="cuda", dtype=torch.float16)
+    name = "debug.tp2.float16"
+    bps_ops.declare(name, expected_workers=1)
+    h = bps_ops.push_pull_async_inplace(x, average=False, name=name)
+    bps_ops.synchronize(h)
+    torch.cuda.synchronize()
+
+    print("done", local_rank, x.cpu().tolist(), flush=True)
+    bps.shutdown()
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    ps = [mp.Process(target=run, args=(i,)) for i in range(2)]
+    for p in ps:
+        p.start()
+    for p in ps:
+        p.join(60)
+    for p in ps:
+        print("pid", p.pid, "exitcode", p.exitcode, flush=True)
+        if p.exitcode is None:
+            p.terminate()
+PY
+
+rm -rf /tmp/byteps_socket
+mkdir -p /tmp/byteps_socket
+CUDA_VISIBLE_DEVICES=0,1 timeout 120s python /tmp/byteps_tp2_pushpull.py
+```
+
+通过标准：
+
+```text
+done 0 [3.0, 3.0, ...]
+done 1 [3.0, 3.0, ...]
+```
+
 ## 5. 安装 SGLang
 
 从同一个二合一仓库安装 SGLang：

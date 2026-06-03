@@ -112,6 +112,16 @@ bps.declare(name, expected_workers=expected_workers)
 
 后续如果同名 tensor 使用了不同 `expected_workers`，直接抛出 `RuntimeError`。
 
+这里的 `expected_workers` 是 BytePS PS server 等待的 worker 节点数，不是 SGLang TP group 的 rank 数。单机多 GPU 首测时：
+
+```text
+bps.size() = 2
+bps.local_size() = 2
+expected_workers = bps.size() // bps.local_size() = 1
+```
+
+如果把 TP rank 数 `2` 传给 BytePS server，server 会等待两个 worker 节点的 push，但单机只有一个 BytePS root worker 会向 server push，导致 `push_pull_async_inplace + synchronize` 卡住。
+
 **2. 稳定 group name**
 
 BytePS name 由 SGLang group 信息和 logical name 组成：

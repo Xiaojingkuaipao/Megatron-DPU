@@ -86,6 +86,13 @@ def declare_and_cache_byteps_group(name: str, expected_workers: int) -> None:
         )
 
 
+def _byteps_expected_workers() -> int:
+    import byteps.torch as bps
+
+    local_size = max(1, bps.local_size())
+    return max(1, bps.size() // local_size)
+
+
 def byteps_allreduce_inplace(
     tensor: torch.Tensor,
     group,
@@ -100,14 +107,18 @@ def byteps_allreduce_inplace(
     from byteps.torch import ops as bps_ops
 
     name = build_byteps_group_name(group, logical_name)
-    declare_and_cache_byteps_group(name, group.world_size)
+    expected_workers = _byteps_expected_workers()
+    declare_and_cache_byteps_group(name, expected_workers)
     if _BPS_DEBUG:
         logger.debug(
-            "BytePS all-reduce: name=%s shape=%s dtype=%s device=%s",
+            "BytePS all-reduce: name=%s shape=%s dtype=%s device=%s "
+            "group_world_size=%s expected_workers=%s",
             name,
             tuple(tensor.shape),
             tensor.dtype,
             tensor.device,
+            group.world_size,
+            expected_workers,
         )
     handle = bps_ops.push_pull_async_inplace(
         tensor,
