@@ -32,6 +32,7 @@
 | `sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py` | TP、attention TP、MoE All-Reduce wrapper 增加可选 `logical_name` 参数。 |
 | `sglang-0.5.10.post1/python/sglang/srt/layers/linear.py` | `RowParallelLinear` 主路径 All-Reduce 传递稳定 BytePS logical name。 |
 | `sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py` | `VocabParallelEmbedding` 主路径 All-Reduce 传递稳定 BytePS logical name。 |
+| `byteps/byteps/common/operations.cc` | 修复 `DMLC_USE_GDR` 未设置时 `byteps_init()` 通过空指针构造 `std::string` 崩溃的问题，默认按 `DMLC_USE_GDR=0` 处理。 |
 
 ## CLI 参数
 
@@ -88,6 +89,14 @@ DMLC_WORKER_ID=0
 - `bps.local_size()` 是否等于 `tp_size * pp_size`。
 
 当前代码没有设置 `DMLC_NUM_SERVER`，也没有校验 `bps.size()`。
+
+BytePS C++ 初始化中，`DMLC_USE_GDR` 未设置时现在按 `0` 处理。也就是说，普通 TCP/ZMQ smoke test 不需要额外开启 GDR；测试命令仍建议显式设置：
+
+```text
+DMLC_USE_GDR=0
+```
+
+如果显式设置 `DMLC_USE_GDR=1`，仍会走原有 GDR 初始化路径。
 
 ## BytePS collective wrapper
 
@@ -260,7 +269,6 @@ pre_warm_nccl and not use_byteps_all_reduce
 - send/recv。
 - BytePS 多机 worker/server 编排。
 - CUDA graph capture 支持。
-- 手工或自动化测试文档。
 
 ## 静态检查
 
@@ -280,6 +288,15 @@ PYTHONPYCACHEPREFIX=/private/tmp/sglang-byteps-pycache python3 -m py_compile \
 ```
 
 结果：通过。
+
+服务器侧已手工验证 BytePS import 和单 worker init smoke test。验证环境使用外部 BytePS scheduler/server，worker 环境显式设置 `DMLC_USE_GDR=0`、`DMLC_NUM_SERVER=1`、`DMLC_ENABLE_RDMA=0`，输出：
+
+```text
+rank: 0
+size: 1
+local_rank: 0
+local_size: 1
+```
 
 未运行：
 

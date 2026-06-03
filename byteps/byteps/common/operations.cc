@@ -34,10 +34,10 @@ namespace common {
 extern "C" {
 
 void byteps_init() {
-  int use_gdr=std::stoi(getenv("DMLC_USE_GDR"));
-  if(use_gdr){
+  int use_gdr = getenv("DMLC_USE_GDR") ? std::stoi(getenv("DMLC_USE_GDR")) : 0;
+  if (use_gdr) {
     byteps_lazy_init_for_gdr();
-  }else{
+  } else {
     byteps_lazy_init();
   }
   BytePSGlobal::GetOrInitPS();

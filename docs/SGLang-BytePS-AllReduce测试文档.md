@@ -25,6 +25,7 @@ cd /Users/zhijingxin/Megatron-DPU
 git status --short
 git add docs/SGLang-BytePS-AllReduce实现说明.md \
   docs/SGLang-BytePS-AllReduce测试文档.md \
+  byteps/byteps/common/operations.cc \
   sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
   sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
   sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
@@ -147,9 +148,10 @@ BYTEPS_WITH_PYTORCH=1 \
 python setup.py install
 ```
 
-BytePS 安装检查：
+BytePS 安装检查。不要在 BytePS 源码目录里做 import 检查，否则当前目录下的 `byteps/` 可能遮蔽已安装包，导致 `c_lib` 导入异常。建议在 `/tmp` 运行：
 
 ```bash
+cd /tmp
 conda activate sgl-dev2
 python - <<'PY'
 import byteps.torch as bps
@@ -160,14 +162,67 @@ print("byteps ops import ok")
 PY
 ```
 
-可选做一个单进程 BytePS init smoke test。这里用 `timeout` 防止环境变量不匹配时一直卡住：
+做 BytePS init smoke test 时，当前 BytePS 构建建议使用外部 scheduler/server。不要用 `bpslaunch` 包裹 SGLang server；这里只单独启动 BytePS scheduler/server 来验证 BytePS 本身。
+
+终端 1，启动 scheduler：
 
 ```bash
+cd /tmp
 conda activate sgl-dev2
+export DMLC_NUM_WORKER=1
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
+export BYTEPS_FORCE_DISTRIBUTED=1
+export BYTEPS_KEY_HASH_FN=raw
+export BYTEPS_PUSH_THREAD=1
+export BYTEPS_LOG_LEVEL=INFO
+export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
+export DMLC_ROLE=scheduler
+bpslaunch
+```
+
+终端 2，启动 server：
+
+```bash
+cd /tmp
+conda activate sgl-dev2
+export DMLC_NUM_WORKER=1
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
+export BYTEPS_FORCE_DISTRIBUTED=1
+export BYTEPS_KEY_HASH_FN=raw
+export BYTEPS_PUSH_THREAD=1
+export BYTEPS_LOG_LEVEL=INFO
+export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
+export DMLC_ROLE=server
+bpslaunch
+```
+
+终端 3，启动 worker smoke test：
+
+```bash
+cd /tmp
+conda activate sgl-dev2
+mkdir -p /tmp/byteps_socket
+
 DMLC_ROLE=worker \
 DMLC_NUM_WORKER=1 \
-DMLC_NUM_SERVER=0 \
+DMLC_NUM_SERVER=1 \
+DMLC_PS_ROOT_URI=127.0.0.1 \
+DMLC_PS_ROOT_PORT=9000 \
 DMLC_WORKER_ID=0 \
+DMLC_ENABLE_RDMA=0 \
+DMLC_USE_GDR=0 \
+DMLC_INTERFACE=lo \
+DMLC_NODE_HOST=127.0.0.1 \
+BYTEPS_FORCE_DISTRIBUTED=1 \
+BYTEPS_KEY_HASH_FN=raw \
+BYTEPS_PUSH_THREAD=1 \
+BYTEPS_SOCKET_PATH=/tmp/byteps_socket \
 BYTEPS_LOCAL_RANK=0 \
 BYTEPS_LOCAL_SIZE=1 \
 timeout 30s python - <<'PY'
@@ -181,7 +236,16 @@ bps.shutdown()
 PY
 ```
 
-如果这个 smoke test 因 `DMLC_NUM_SERVER`、scheduler 或 server 相关环境报错，不要用 `bpslaunch` 包裹 SGLang server，先继续按后文 SGLang 启动方式测试；必要时再使用“外部 BytePS scheduler/server 兜底模式”。
+通过标准：
+
+```text
+rank: 0
+size: 1
+local_rank: 0
+local_size: 1
+```
+
+如果没有拉取包含 `byteps/byteps/common/operations.cc` 修复的代码，`DMLC_USE_GDR` 未设置时可能出现 `basic_string::_M_construct null not valid`。临时绕过方式是在 scheduler、server、worker 环境中都显式设置 `DMLC_USE_GDR=0`；拉取修复后，未设置时默认也按 `0` 处理。
 
 ## 5. 安装 SGLang
 
@@ -226,7 +290,9 @@ PYTHONPYCACHEPREFIX=/tmp/sglang-byteps-pycache python -m py_compile \
 
 首测使用 2 张 GPU。下面示例模型路径是 `/data/models/Qwen2.5-0.5B-Instruct`，测试时替换成服务器真实模型目录。
 
-启动前先设置环境。不要手动设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`，这两个值由 SGLang model worker 内部按 `gpu_id` 和 `tp_size * pp_size` 设置。
+启动前先确认 BytePS scheduler/server 已按第 10 节方式保持运行。不要用 `bpslaunch` 包裹 SGLang server；SGLang server 仍直接用 `python -m sglang...` 启动。
+
+不要手动设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`，这两个值由 SGLang model worker 内部按 `gpu_id` 和 `tp_size * pp_size` 设置。
 
 ```bash
 conda activate sgl-dev2
@@ -234,12 +300,16 @@ unset BYTEPS_LOCAL_RANK
 unset BYTEPS_LOCAL_SIZE
 export DMLC_ROLE=worker
 export DMLC_NUM_WORKER=1
-export DMLC_NUM_SERVER=0
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
 export DMLC_WORKER_ID=0
+export BYTEPS_FORCE_DISTRIBUTED=1
 export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
 ```
 
 启动 BytePS All-Reduce 服务：
@@ -372,11 +442,9 @@ RDMA/UCX 出问题时，先回退：
 export DMLC_ENABLE_RDMA=0
 ```
 
-## 10. 外部 BytePS scheduler/server 兜底模式
+## 10. 启动外部 BytePS scheduler/server
 
-首测不建议使用这一模式。只有当 `DMLC_NUM_SERVER=0` 的本机模式在当前 BytePS 构建中不可用，或需要验证 BytePS scheduler/server 链路时再用。
-
-注意：即使使用外部 scheduler/server，也不要用 `bpslaunch` 包裹 SGLang server。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang...` 启动。
+当前测试流程推荐使用这一模式。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang...` 启动，不要用 `bpslaunch` 包裹 SGLang server。
 
 终端 1，启动 scheduler：
 
@@ -391,6 +459,7 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
 export DMLC_ROLE=scheduler
 bpslaunch
 ```
@@ -408,6 +477,7 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
 export DMLC_ROLE=server
 bpslaunch
 ```
@@ -427,10 +497,11 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_USE_GDR=0
 export DMLC_ROLE=worker
 export DMLC_WORKER_ID=0
 
-cd /workspace//Megatron-DPU/sglang-0.5.10.post1
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
   --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
@@ -476,10 +547,17 @@ RDMA 连接失败：
 先回退 `DMLC_ENABLE_RDMA=0`。如果 TCP 正常，再检查网卡、端口、防火墙、UCX/RDMA runtime，并确认 BytePS 是用 `BYTEPS_WITH_UCX=1` 编译安装的。
 
 `DMLC_NUM_SERVER` 相关错误：
-当前 SGLang wrapper 会设置 `DMLC_ROLE`、`DMLC_NUM_WORKER`、`DMLC_WORKER_ID` 的默认值，但不会设置 `DMLC_NUM_SERVER`。首测建议在启动 SGLang 前显式设置：
+当前 SGLang wrapper 会设置 `DMLC_ROLE`、`DMLC_NUM_WORKER`、`DMLC_WORKER_ID` 的默认值，但不会设置 `DMLC_NUM_SERVER`、`DMLC_PS_ROOT_URI` 和 `DMLC_PS_ROOT_PORT`。首测建议按第 10 节启动外部 scheduler/server，并在启动 SGLang 前显式设置：
 
 ```bash
-export DMLC_NUM_SERVER=0
+export DMLC_NUM_SERVER=1
+export DMLC_PS_ROOT_URI=127.0.0.1
+export DMLC_PS_ROOT_PORT=9000
 ```
 
-如果当前 BytePS 构建不接受 `DMLC_NUM_SERVER=0`，使用第 10 节的外部 scheduler/server 兜底模式。
+`basic_string::_M_construct null not valid`：
+旧代码在 `byteps_init()` 中直接读取 `DMLC_USE_GDR`，如果未设置会崩溃。拉取包含 `byteps/byteps/common/operations.cc` 修复的代码并重新安装 BytePS；临时绕过是在 scheduler、server、worker 环境中都显式设置：
+
+```bash
+export DMLC_USE_GDR=0
+```
