@@ -878,11 +878,22 @@ def check_torch_version():
     return version
 
 
+def get_torch_include_paths(cuda=False):
+    from torch.utils.cpp_extension import include_paths
+
+    try:
+        return include_paths(cuda=cuda)
+    except TypeError:
+        device_type = 'cuda' if cuda else 'cpu'
+        return include_paths(device_type=device_type)
+
+
 def is_torch_cuda(build_ext, include_dirs, extra_compile_args):
     try:
-        from torch.utils.cpp_extension import include_paths
-        test_compile(build_ext, 'test_torch_cuda', include_dirs=include_dirs + include_paths(cuda=True),
-                     extra_compile_preargs=extra_compile_args, code=textwrap.dedent('''\
+        test_compile(build_ext, 'test_torch_cuda',
+                     include_dirs=include_dirs + get_torch_include_paths(cuda=True),
+                     extra_compile_preargs=extra_compile_args,
+                     code=textwrap.dedent('''\
             void test() {
             }
             '''))
