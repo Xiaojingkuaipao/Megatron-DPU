@@ -2,14 +2,6 @@
 
 本文档按当前二合一仓库编写。服务器上只需要一份 `Megatron-DPU` 仓库，BytePS 从 `byteps/` 安装，SGLang 从 `sglang-0.5.10.post1/python/` 安装。
 
-下面命令统一假设服务器代码目录是：
-
-```text
-/home/xzj/Megatron-DPU
-```
-
-如果服务器实际目录不同，直接把命令里的 `/home/xzj/Megatron-DPU` 替换成真实目录。本文不再使用 `SGLANG_REPO`、`MEGATRON_DPU_REPO` 这类路径变量。
-
 ## 1. 测试目标
 
 验证 `--use-byteps-all-reduce` 能把 SGLang 模型计算主路径 All-Reduce 路由到本仓库里的 BytePS。
@@ -47,15 +39,15 @@ git push
 服务器如果还没有仓库：
 
 ```bash
-git clone <Megatron-DPU-git-url> /home/xzj/Megatron-DPU
-cd /home/xzj/Megatron-DPU
+git clone <Megatron-DPU-git-url> /workspace/Megatron-DPU
+cd /workspace/Megatron-DPU
 git checkout <包含本次修改的分支>
 ```
 
 服务器如果已经有仓库：
 
 ```bash
-cd /home/xzj/Megatron-DPU
+cd /workspace/Megatron-DPU
 git fetch --all --prune
 git checkout <包含本次修改的分支>
 git pull --ff-only
@@ -64,25 +56,25 @@ git pull --ff-only
 确认服务器代码包含本次修改：
 
 ```bash
-cd /home/xzj/Megatron-DPU
-test -f /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py
-grep -R "use-byteps-all-reduce" -n /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py
-grep -R "set_byteps_all_reduce" -n /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py
+cd /workspace/Megatron-DPU
+test -f /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py
+grep -R "use-byteps-all-reduce" -n /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py
+grep -R "set_byteps_all_reduce" -n /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py
 ```
 
 BytePS 依赖 `3rdparty/ps-lite`。如果服务器上这个目录不完整，先补齐：
 
 ```bash
-cd /home/xzj/Megatron-DPU/byteps
+cd /workspace/Megatron-DPU/byteps
 git submodule update --init --recursive
-test -d /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite/src
+test -d /workspace/Megatron-DPU/byteps/3rdparty/ps-lite/src
 ```
 
 如果上面的 submodule 命令不能识别 `ps-lite`，用下面的兜底方式：
 
 ```bash
-rm -rf /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite
-git clone -b byteps https://github.com/bytedance/ps-lite /home/xzj/Megatron-DPU/byteps/3rdparty/ps-lite
+rm -rf /workspace/Megatron-DPU/byteps/3rdparty/ps-lite
+git clone -b byteps https://github.com/bytedance/ps-lite /workspace/Megatron-DPU/byteps/3rdparty/ps-lite
 ```
 
 ## 3. 进入 Python 环境
@@ -117,16 +109,16 @@ PY
 ```bash
 conda activate sgl-dev2
 python -m pip uninstall -y byteps
-rm -rf /home/xzj/Megatron-DPU/byteps/build
-rm -rf /home/xzj/Megatron-DPU/byteps/dist
-rm -rf /home/xzj/Megatron-DPU/byteps/byteps.egg-info
+rm -rf /workspace/Megatron-DPU/byteps/build
+rm -rf /workspace/Megatron-DPU/byteps/dist
+rm -rf /workspace/Megatron-DPU/byteps/byteps.egg-info
 ```
 
 安装普通 TCP/本机测试版。首测建议先用这个，不要一开始就引入 RDMA/UCX：
 
 ```bash
 conda activate sgl-dev2
-cd /home/xzj/Megatron-DPU/byteps
+cd /workspace/Megatron-DPU/byteps
 BYTEPS_WITHOUT_TENSORFLOW=1 \
 BYTEPS_WITHOUT_MXNET=1 \
 BYTEPS_WITH_PYTORCH=1 \
@@ -144,10 +136,10 @@ export BYTEPS_NCCL_HOME=/usr/local/nccl
 ```bash
 conda activate sgl-dev2
 python -m pip uninstall -y byteps
-rm -rf /home/xzj/Megatron-DPU/byteps/build
-rm -rf /home/xzj/Megatron-DPU/byteps/dist
-rm -rf /home/xzj/Megatron-DPU/byteps/byteps.egg-info
-cd /home/xzj/Megatron-DPU/byteps
+rm -rf /workspace/Megatron-DPU/byteps/build
+rm -rf /workspace/Megatron-DPU/byteps/dist
+rm -rf /workspace/Megatron-DPU/byteps/byteps.egg-info
+cd /workspace/Megatron-DPU/byteps
 BYTEPS_WITH_UCX=1 \
 BYTEPS_WITHOUT_TENSORFLOW=1 \
 BYTEPS_WITHOUT_MXNET=1 \
@@ -197,7 +189,7 @@ PY
 
 ```bash
 conda activate sgl-dev2
-cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 python -m pip install -e "python"
 ```
 
@@ -221,13 +213,13 @@ PY
 ```bash
 conda activate sgl-dev2
 PYTHONPYCACHEPREFIX=/tmp/sglang-byteps-pycache python -m py_compile \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/linear.py \
-  /home/xzj/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/linear.py \
+  /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py
 ```
 
 ## 6. 启动 BytePS 版 SGLang
@@ -254,7 +246,7 @@ export DMLC_ENABLE_RDMA=0
 
 ```bash
 conda activate sgl-dev2
-cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
   --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
@@ -318,7 +310,7 @@ curl http://127.0.0.1:30000/generate \
 
 ```bash
 conda activate sgl-dev2
-cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
   --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
@@ -438,7 +430,7 @@ export DMLC_ENABLE_RDMA=0
 export DMLC_ROLE=worker
 export DMLC_WORKER_ID=0
 
-cd /home/xzj/Megatron-DPU/sglang-0.5.10.post1
+cd /workspace//Megatron-DPU/sglang-0.5.10.post1
 CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
   --model-path /data/models/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
@@ -455,13 +447,13 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
 ## 11. 常见问题
 
 `ModuleNotFoundError: No module named 'byteps'`：
-进入 `/home/xzj/Megatron-DPU/byteps`，在 `sgl-dev2` 环境中重新执行 `python setup.py install`。
+进入 `/workspace/Megatron-DPU/byteps`，在 `sgl-dev2` 环境中重新执行 `python setup.py install`。
 
 找不到 `--use-byteps-all-reduce`：
 服务器安装的不是当前仓库里的 SGLang。检查 `python -c "import sglang; print(sglang.__file__)"`，并重新执行 `python -m pip install -e "python"`。
 
 `Missing ./3rdparty/ps-lite`：
-进入 `/home/xzj/Megatron-DPU/byteps`，执行 `git submodule update --init --recursive`。如果仍不行，按第 2 节兜底方式 clone `ps-lite`。
+进入 `/workspace/Megatron-DPU/byteps`，执行 `git submodule update --init --recursive`。如果仍不行，按第 2 节兜底方式 clone `ps-lite`。
 
 CUDA graph 报错：
 这是预期保护。BytePS phase 1 必须禁用 CUDA graph 和 piecewise CUDA graph。
