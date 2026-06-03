@@ -290,12 +290,15 @@ PYTHONPYCACHEPREFIX=/tmp/sglang-byteps-pycache python -m py_compile \
 
 首测使用 2 张 GPU。下面示例模型路径是 `/data/models/Qwen2.5-0.5B-Instruct`，测试时替换成服务器真实模型目录。
 
-启动前先确认 BytePS scheduler/server 已按第 10 节方式保持运行。不要用 `bpslaunch` 包裹 SGLang server；SGLang server 仍直接用 `python -m sglang...` 启动。
+启动前先确认 BytePS scheduler/server 已按第 10 节方式保持运行。不要用 `bpslaunch` 包裹 SGLang server；SGLang server 使用常规入口 `python -m sglang.launch_server` 启动。
 
 不要手动设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`，这两个值由 SGLang model worker 内部按 `gpu_id` 和 `tp_size * pp_size` 设置。
 
 ```bash
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 conda activate sgl-dev2
+mkdir -p /tmp/byteps_socket
+
 unset BYTEPS_LOCAL_RANK
 unset BYTEPS_LOCAL_SIZE
 export DMLC_ROLE=worker
@@ -308,20 +311,23 @@ export BYTEPS_FORCE_DISTRIBUTED=1
 export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
+export BYTEPS_SOCKET_PATH=/tmp/byteps_socket
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 ```
 
 启动 BytePS All-Reduce 服务：
 
 ```bash
-conda activate sgl-dev2
-cd /workspace/Megatron-DPU/sglang-0.5.10.post1
-CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
-  --model-path /data/models/Qwen2.5-0.5B-Instruct \
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 30000 \
+  --log-level info \
+  --dtype float16 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
@@ -330,11 +336,22 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
   --byteps-all-reduce-debug
 ```
 
+`--dtype float16` 是当前首测必需项。Qwen2.5 默认会使用 BF16，而当前 BytePS PyTorch op 不支持 `torch.cuda.BFloat16Tensor`，否则第一次 BytePS All-Reduce 会报：
+
+```text
+Tensor type torch.cuda.BFloat16Tensor is not supported.
+```
+
 期望日志：
 
-- `BytePS initialized for SGLang`
+- `BytePS initialized for SGLang: rank=0 local_rank=0 size=2 local_size=2`
+- `BytePS initialized for SGLang: rank=1 local_rank=1 size=2 local_size=2`
+- `Application startup complete.`
+- `Uvicorn running on http://0.0.0.0:30000`
 - `Declared BytePS tensor name=...`
 - 如果日志级别允许 debug，还会看到 `Routing all_reduce through BytePS`
+
+启动成功只表示 HTTP server 和两个 TP worker 已起来。第一次请求后，日志中出现 `Declared BytePS tensor name=...` 才说明模型主路径已经进入 BytePS All-Reduce。
 
 如果启动时报 CUDA graph 或 piecewise CUDA graph 相关错误，确认命令里已经包含：
 
@@ -362,17 +379,20 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
 ```bash
 curl http://127.0.0.1:30000/generate \
   -H 'Content-Type: application/json' \
-  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":16}}'
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":1}}'
 ```
 
 通过标准：
 
 - 请求能正常返回。
 - 日志中出现 BytePS 初始化和 declare 信息。
+- 首次请求至少应看到 `Declared BytePS tensor name=sglang.tp:0...`。
 - 没有 hang。
 - 没有 tensor name mismatch。
 - 没有 group size mismatch。
 - 没有 fallback 到 custom All-Reduce、PyNccl、MSCCLPP、TorchSymmMem 或 `torch.distributed` 的报错。
+
+如果服务已经打印 `Application startup complete`，但 `curl /generate` 卡住不返回，说明启动成功但首次 BytePS collective 可能没有完成。先查看 SGLang、scheduler、server 三个终端是否都有后续日志，再检查两个 TP rank 是否都声明了同一个 BytePS tensor name。
 
 ## 8. NCCL baseline 对照
 
@@ -381,11 +401,13 @@ curl http://127.0.0.1:30000/generate \
 ```bash
 conda activate sgl-dev2
 cd /workspace/Megatron-DPU/sglang-0.5.10.post1
-CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
-  --model-path /data/models/Qwen2.5-0.5B-Instruct \
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 30001 \
+  --log-level info \
+  --dtype float16 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
@@ -397,7 +419,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
 ```bash
 curl http://127.0.0.1:30001/generate \
   -H 'Content-Type: application/json' \
-  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":16}}'
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":1}}'
 ```
 
 对比要点：
@@ -444,11 +466,12 @@ export DMLC_ENABLE_RDMA=0
 
 ## 10. 启动外部 BytePS scheduler/server
 
-当前测试流程推荐使用这一模式。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang...` 启动，不要用 `bpslaunch` 包裹 SGLang server。
+当前测试流程推荐使用这一模式。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang.launch_server` 启动，不要用 `bpslaunch` 包裹 SGLang server。
 
 终端 1，启动 scheduler：
 
 ```bash
+cd /tmp
 conda activate sgl-dev2
 export DMLC_NUM_WORKER=1
 export DMLC_NUM_SERVER=1
@@ -467,6 +490,7 @@ bpslaunch
 终端 2，启动 server：
 
 ```bash
+cd /tmp
 conda activate sgl-dev2
 export DMLC_NUM_WORKER=1
 export DMLC_NUM_SERVER=1
@@ -485,7 +509,10 @@ bpslaunch
 终端 3，启动 SGLang worker。这里仍然不要设置 `BYTEPS_LOCAL_RANK` 和 `BYTEPS_LOCAL_SIZE`：
 
 ```bash
+cd /workspace/Megatron-DPU/sglang-0.5.10.post1
 conda activate sgl-dev2
+mkdir -p /tmp/byteps_socket
+
 unset BYTEPS_LOCAL_RANK
 unset BYTEPS_LOCAL_SIZE
 export DMLC_NUM_WORKER=1
@@ -496,17 +523,21 @@ export BYTEPS_FORCE_DISTRIBUTED=1
 export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
+export BYTEPS_SOCKET_PATH=/tmp/byteps_socket
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 export DMLC_ROLE=worker
 export DMLC_WORKER_ID=0
 
-cd /workspace/Megatron-DPU/sglang-0.5.10.post1
-CUDA_VISIBLE_DEVICES=0,1 python -m sglang.srt.entrypoints.http_server \
-  --model-path /data/models/Qwen2.5-0.5B-Instruct \
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --tp-size 2 \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 30000 \
+  --log-level info \
+  --dtype float16 \
   --disable-custom-all-reduce \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
@@ -543,8 +574,32 @@ unset BYTEPS_LOCAL_SIZE
 All-Reduce hang：
 先用 `DMLC_ENABLE_RDMA=0` 和 `BYTEPS_PUSH_THREAD=1` 跑 TCP/本机路径。确认普通路径正常后，再测试 RDMA/UCX。
 
+启动成功但首次 `curl /generate` 卡住：
+如果日志已经出现 `Application startup complete` 和两个 TP rank 的 `BytePS initialized for SGLang`，说明 SGLang 服务启动成功。若第一次请求后停在 `Declared BytePS tensor name=...` 或 `tensor size=...`，说明请求进入了 BytePS All-Reduce，但 collective 没有完成。先确认两个 TP rank 都声明了同一个 tensor name，再看 BytePS scheduler/server 终端是否还有后续日志。
+
 RDMA 连接失败：
 先回退 `DMLC_ENABLE_RDMA=0`。如果 TCP 正常，再检查网卡、端口、防火墙、UCX/RDMA runtime，并确认 BytePS 是用 `BYTEPS_WITH_UCX=1` 编译安装的。
+
+`Address already in use. errno = 98`：
+这是 `DMLC_PS_ROOT_PORT` 被旧 BytePS scheduler/server 或其他进程占用。清理旧进程后再启动：
+
+```bash
+pkill -f "byteps.server" || true
+pkill -f "bpslaunch" || true
+pkill -f "sglang.launch_server" || true
+pkill -f "sglang.srt" || true
+rm -rf /tmp/byteps_socket
+mkdir -p /tmp/byteps_socket
+```
+
+或者把 scheduler、server、SGLang worker 三边的 `DMLC_PS_ROOT_PORT` 一起改成未占用端口。
+
+`Tensor type torch.cuda.BFloat16Tensor is not supported`：
+当前 BytePS PyTorch op 不支持 BF16 tensor。首测启动 SGLang 时使用：
+
+```bash
+--dtype float16
+```
 
 `DMLC_NUM_SERVER` 相关错误：
 当前 SGLang wrapper 会设置 `DMLC_ROLE`、`DMLC_NUM_WORKER`、`DMLC_WORKER_ID` 的默认值，但不会设置 `DMLC_NUM_SERVER`、`DMLC_PS_ROOT_URI` 和 `DMLC_PS_ROOT_PORT`。首测建议按第 10 节启动外部 scheduler/server，并在启动 SGLang 前显式设置：
