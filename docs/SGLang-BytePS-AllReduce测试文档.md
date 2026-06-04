@@ -233,6 +233,8 @@ local_size: 1
 
 **关于 `expected_workers`**：这里 `expected_workers=1`，不是 `2`。`byteps_collectives.py` 中的 `_byteps_expected_workers()` 辅助函数计算方式为 `max(1, bps.size() // bps.local_size())`。单机两个本地 rank 时 `bps.size()=2, bps.local_size()=2`，结果为 `max(1, 2 // 2) = 1`。BytePS server 等待的是 worker 节点数（跨机器），不是本地 GPU rank 数。如果误写成 `expected_workers=2`，server 会等待两个 worker 节点的 push，但单机只有一个 BytePS root worker 会向 server push，导致 `push_pull_async_inplace + synchronize` 卡住。
 
+**注意**：本 smoke test 结尾的 `bps.shutdown()` 会向 scheduler 发送 SHUTDOWN 信号，导致 scheduler 和 server 进程退出。如果接下来要启动 SGLang（第 6 节），**必须重新启动 scheduler 和 server**（按第 10 节步骤）。
+
 ```bash
 cat > /tmp/byteps_tp2_pushpull.py <<'PY'
 import os
@@ -342,7 +344,7 @@ PYTHONPYCACHEPREFIX=/tmp/sglang-byteps-pycache python -m py_compile \
 
 ## 6. 启动 BytePS 版 SGLang
 
-首测使用 2 张 GPU。下面示例模型路径是 `/data/models/Qwen2.5-0.5B-Instruct`，测试时替换成服务器真实模型目录。
+首测使用 2 张 GPU。下面示例使用 HuggingFace 模型 ID `Qwen/Qwen2.5-0.5B-Instruct`，首次运行时会自动下载到缓存目录。
 
 启动前先确认 BytePS scheduler/server 已按第 10 节方式保持运行。不要用 `bpslaunch` 包裹 SGLang server；SGLang server 使用常规入口 `python -m sglang.launch_server` 启动。
 
@@ -402,7 +404,8 @@ Tensor type torch.cuda.BFloat16Tensor is not supported.
 - `BytePS initialized for SGLang: rank=1 local_rank=1 size=2 local_size=2`
 - `Application startup complete.`
 - `Uvicorn running on http://0.0.0.0:30000`
-- `Declared BytePS tensor name=...`
+- `Declared BytePS tensor name=sglang.tp:0.rXXXX.row_parallel_linear.model.layers.0.self_attn.o_proj.6x896 expected_workers=1`
+  - tensor name 末尾的 `6x896` 是 shape 后缀，`byteps_collectives.py` 自动拼接，用于隔离不同 batch size 的 BytePS 声明。
 - 如果日志级别允许 debug，还会看到 `Routing all_reduce through BytePS`
 
 启动成功只表示 HTTP server 和两个 TP worker 已起来。第一次请求后，日志中出现 `Declared BytePS tensor name=...` 才说明模型主路径已经进入 BytePS All-Reduce。
@@ -448,15 +451,15 @@ curl http://127.0.0.1:30000/generate \
 
 通过标准：
 
-- 请求能正常返回。
-- 日志中出现 BytePS 初始化和 declare 信息。
-- 首次请求至少应看到 `Declared BytePS tensor name=sglang.tp:0...`。
+- 请求能正常返回，内容如 `{"text":" Paris","output_ids":[12095],...}`。
+- 日志中出现 BytePS 初始化、declare 和 push_pull 操作日志。
+- 首次请求至少应看到 `Declared BytePS tensor name=sglang.tp:0.rXXXX.row_parallel_linear.model.layers.0.self_attn.o_proj.6x896`（带 shape 后缀）。
 - 没有 hang。
 - 没有 tensor name mismatch。
 - 没有 group size mismatch。
 - 没有 fallback 到 custom All-Reduce、PyNccl、MSCCLPP、TorchSymmMem 或 `torch.distributed` 的报错。
 
-如果服务已经打印 `Application startup complete`，但 `curl /generate` 卡住不返回，说明启动成功但首次 BytePS collective 可能没有完成。先查看 SGLang、scheduler、server 三个终端是否都有后续日志，再检查两个 TP rank 是否都声明了同一个 BytePS tensor name。
+如果服务已经打印 `Application startup complete`，但 `curl /generate` 卡住不返回，说明启动成功但首次 BytePS collective 可能没有完成。先查看 SGLang、scheduler、server 三个终端是否都有后续日志，再检查两个 TP rank 是否都声明了同一个 BytePS tensor name。常见原因是不同 forward pass 使用了相同 tensor name 但不同 shape（如 prefill 和 decode 维度不同），BytePS 不支持同名复用不同大小的 tensor。
 
 ## 8. NCCL baseline 对照
 
@@ -531,6 +534,17 @@ export DMLC_ENABLE_RDMA=0
 ## 10. 启动外部 BytePS scheduler/server
 
 当前测试流程推荐使用这一模式。只单独启动 BytePS scheduler/server，SGLang 仍直接用 `python -m sglang.launch_server` 启动，不要用 `bpslaunch` 包裹 SGLang server。
+
+如果之前运行过 smoke test 或其他 BytePS 进程，先清理：
+
+```bash
+pkill -f "byteps.server" || true
+pkill -f "bpslaunch" || true
+pkill -f "sglang.launch_server" || true
+pkill -f "sglang.srt" || true
+rm -rf /tmp/byteps_socket
+mkdir -p /tmp/byteps_socket
+```
 
 终端 1，启动 scheduler：
 
@@ -645,7 +659,12 @@ All-Reduce hang：
 另外，开启 `--byteps-all-reduce-debug` 后 `byteps_allreduce_inplace()` 会打印每条 All-Reduce 的 `group_world_size`（SGLang TP group rank 数）和 `expected_workers`（BytePS server 等待的 worker 节点数）。如果 hang 时日志显示两个 TP rank 的 `expected_workers` 不一致，说明 declaration 前后不匹配，检查 BytePS scheduler/server 的 `DMLC_NUM_WORKER` 配置。
 
 启动成功但首次 `curl /generate` 卡住：
-如果日志已经出现 `Application startup complete` 和两个 TP rank 的 `BytePS initialized for SGLang`，说明 SGLang 服务启动成功。若第一次请求后停在 `Declared BytePS tensor name=...` 或 `tensor size=...`，说明请求进入了 BytePS All-Reduce，但 collective 没有完成。先确认两个 TP rank 都声明了同一个 tensor name，再看 BytePS scheduler/server 终端是否还有后续日志。
+如果日志已经出现 `Application startup complete` 和两个 TP rank 的 `BytePS initialized for SGLang`，说明 SGLang 服务启动成功。排查步骤：
+
+1. 确认 warmup 的所有 forward pass 都已完成。如果 warmup prefill 有 `Declared` 日志但 decode 没有，说明 BytePS tensor name 在 prefill 和 decode 间共用了不同 shape。检查 `byteps_collectives.py` 中是否已包含 shape 后缀拼接（见实现说明 Bug #2）。
+2. 确认两个 TP rank 都声明了同一个 tensor name（含 shape 后缀）。
+3. 查看 BytePS scheduler/server 终端是否还有后续日志。
+4. 也可以用 `--log-level debug` 启动 SGLang，观察 `[BytePS-DEBUG] Entering model_runner.forward` 是否出现在 `returned` 之后——如果只出现 Entering 而没有 returned，说明某一层 BytePS push_pull 卡住。
 
 RDMA 连接失败：
 先回退 `DMLC_ENABLE_RDMA=0`。如果 TCP 正常，再检查网卡、端口、防火墙、UCX/RDMA runtime，并确认 BytePS 是用 `BYTEPS_WITH_UCX=1` 编译安装的。
