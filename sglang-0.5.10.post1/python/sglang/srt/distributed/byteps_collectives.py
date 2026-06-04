@@ -27,6 +27,12 @@ def initialize_byteps_for_sglang(
     import byteps.torch as bps
 
     if not _BPS_INITIALIZED:
+        # Ensure all local ranks reach init simultaneously so the BytePS
+        # root device (local_rank=0) can register before the scheduler
+        # finalizes the ADD_NODE barrier.
+        if local_size > 1:
+            import torch.distributed
+            torch.distributed.barrier()
         bps.init()
         _BPS_INITIALIZED = True
 
@@ -106,7 +112,14 @@ def byteps_allreduce_inplace(
 
     from byteps.torch import ops as bps_ops
 
-    name = build_byteps_group_name(group, logical_name)
+    # Include tensor shape in the BytePS name so that different batch
+    # sizes (e.g. prefill vs decode) use independent server-side
+    # buffers. BytePS does not support reusing the same name with
+    # different tensor sizes across forward passes.
+    shape_suffix = "x".join(str(d) for d in tensor.shape)
+    name = build_byteps_group_name(
+        group, f"{logical_name}.{shape_suffix}"
+    )
     expected_workers = _byteps_expected_workers()
     declare_and_cache_byteps_group(name, expected_workers)
     if _BPS_DEBUG:

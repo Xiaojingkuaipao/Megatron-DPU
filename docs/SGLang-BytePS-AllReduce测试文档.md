@@ -16,62 +16,29 @@
 - 首测建议单机多 GPU，先用 `--tp-size 2`。
 - 不要用外层 `bpslaunch` 包 SGLang server。SGLang model worker 会在进程内设置 BytePS local rank/local size 并初始化 BytePS。
 
-## 2. 提交并更新服务器代码
-
-本地提交并推送：
+## 2. 拉取仓库代码
 
 ```bash
-cd /Users/zhijingxin/Megatron-DPU
-git status --short
-git add docs/SGLang-BytePS-AllReduce实现说明.md \
-  docs/SGLang-BytePS-AllReduce测试文档.md \
-  byteps/byteps/common/operations.cc \
-  sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py \
-  sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py \
-  sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py \
-  sglang-0.5.10.post1/python/sglang/srt/layers/linear.py \
-  sglang-0.5.10.post1/python/sglang/srt/layers/vocab_parallel_embedding.py \
-  sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py \
-  sglang-0.5.10.post1/python/sglang/srt/server_args.py
-git commit -m "Add SGLang BytePS all-reduce path"
-git push
-```
-
-服务器如果还没有仓库：
-
-```bash
+# 首次拉取
 git clone <Megatron-DPU-git-url> /workspace/Megatron-DPU
 cd /workspace/Megatron-DPU
 git checkout <包含本次修改的分支>
-```
 
-服务器如果已经有仓库：
-
-```bash
+# 已有仓库则更新
 cd /workspace/Megatron-DPU
 git fetch --all --prune
 git checkout <包含本次修改的分支>
 git pull --ff-only
 ```
 
-确认服务器代码包含本次修改：
-
-```bash
-cd /workspace/Megatron-DPU
-test -f /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py
-grep -R "use-byteps-all-reduce" -n /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/server_args.py
-grep -R "set_byteps_all_reduce" -n /workspace/Megatron-DPU/sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py
-```
-
-BytePS 依赖 `3rdparty/ps-lite`。如果服务器上这个目录不完整，先补齐：
+BytePS 依赖 `3rdparty/ps-lite`，拉取后补齐子模块：
 
 ```bash
 cd /workspace/Megatron-DPU/byteps
 git submodule update --init --recursive
-test -d /workspace/Megatron-DPU/byteps/3rdparty/ps-lite/src
 ```
 
-如果上面的 submodule 命令不能识别 `ps-lite`，用下面的兜底方式：
+如果 submodule 命令不能识别 `ps-lite`，用兜底方式：
 
 ```bash
 rm -rf /workspace/Megatron-DPU/byteps/3rdparty/ps-lite
@@ -258,9 +225,13 @@ local_rank: 0
 local_size: 1
 ```
 
+> 注意：本 smoke test 显式设置 `BYTEPS_LOCAL_SIZE=1`，仅用于验证 BytePS 基础可用性。在 SGLang 实际运行时，`initialize_byteps_for_sglang()` 会按 `tp_size * pp_size` 设置 `BYTEPS_LOCAL_SIZE`（例如 `--tp-size 2` 时为 2）。两者在各自场景下都是正确的，不要将 smoke test 的 `1` 作为 SGLang 运行时的值。
+
 如果没有拉取包含 `byteps/byteps/common/operations.cc` 修复的代码，`DMLC_USE_GDR` 未设置时可能出现 `basic_string::_M_construct null not valid`。临时绕过方式是在 scheduler、server、worker 环境中都显式设置 `DMLC_USE_GDR=0`；拉取修复后，未设置时默认也按 `0` 处理。
 
-可选再做一个单机双 rank `float16 push_pull` smoke test。注意这里 `expected_workers=1`，因为 BytePS server 等待的是 worker 节点数；单机两个本地 rank 只有一个 local root 会向 server push。如果误写成 `expected_workers=2`，会卡在 `push_pull_async_inplace + synchronize`。
+可选再做一个单机双 rank `float16 push_pull` smoke test。
+
+**关于 `expected_workers`**：这里 `expected_workers=1`，不是 `2`。`byteps_collectives.py` 中的 `_byteps_expected_workers()` 辅助函数计算方式为 `max(1, bps.size() // bps.local_size())`。单机两个本地 rank 时 `bps.size()=2, bps.local_size()=2`，结果为 `max(1, 2 // 2) = 1`。BytePS server 等待的是 worker 节点数（跨机器），不是本地 GPU rank 数。如果误写成 `expected_workers=2`，server 会等待两个 worker 节点的 push，但单机只有一个 BytePS root worker 会向 server push，导致 `push_pull_async_inplace + synchronize` 卡住。
 
 ```bash
 cat > /tmp/byteps_tp2_pushpull.py <<'PY'
@@ -454,6 +425,16 @@ Tensor type torch.cuda.BFloat16Tensor is not supported.
 ```text
 --enable-aiter-allreduce-fusion
 ```
+
+`scheduler/server 节点注册异常（启动后无任何 declare 日志）`：
+如果 SGLang 启动成功但首次请求后只看到 `BytePS initialized for SGLang` 而没有 `Declared BytePS tensor name=`，说明 BytePS worker 节点未能成功注册到 scheduler。开启节点注册调试日志排查：
+
+```bash
+export BYTEPS_DEBUG_NODE_REGISTRATION=1
+export BYTEPS_LOG_LEVEL=INFO
+```
+
+设置后 scheduler 终端会打印每次 ADD_NODE 的 collected_nodes/expected_nodes 和完整 node 列表，ZMQ 连接建立时也会打印 node id/addr。常见原因是 scheduler 未先于 SGLang worker 启动、`DMLC_PS_ROOT_PORT` 端口不一致或 `BYTEPS_SOCKET_PATH` 目录未创建。
 
 ## 7. 请求验证
 
@@ -660,6 +641,8 @@ unset BYTEPS_LOCAL_SIZE
 
 All-Reduce hang：
 先用 `DMLC_ENABLE_RDMA=0` 和 `BYTEPS_PUSH_THREAD=1` 跑 TCP/本机路径。确认普通路径正常后，再测试 RDMA/UCX。
+
+另外，开启 `--byteps-all-reduce-debug` 后 `byteps_allreduce_inplace()` 会打印每条 All-Reduce 的 `group_world_size`（SGLang TP group rank 数）和 `expected_workers`（BytePS server 等待的 worker 节点数）。如果 hang 时日志显示两个 TP rank 的 `expected_workers` 不一致，说明 declaration 前后不匹配，检查 BytePS scheduler/server 的 `DMLC_NUM_WORKER` 配置。
 
 启动成功但首次 `curl /generate` 卡住：
 如果日志已经出现 `Application startup complete` 和两个 TP rank 的 `BytePS initialized for SGLang`，说明 SGLang 服务启动成功。若第一次请求后停在 `Declared BytePS tensor name=...` 或 `tensor size=...`，说明请求进入了 BytePS All-Reduce，但 collective 没有完成。先确认两个 TP rank 都声明了同一个 tensor name，再看 BytePS scheduler/server 终端是否还有后续日志。
