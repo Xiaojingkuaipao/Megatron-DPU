@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -142,6 +143,8 @@ class ZMQVan : public Van {
     CHECK_NE(node.port, node.kEmpty);
     CHECK(node.hostname.size());
     int id = node.id;
+    bool node_debug = getenv("BYTEPS_DEBUG_NODE_REGISTRATION") &&
+                      atoi(getenv("BYTEPS_DEBUG_NODE_REGISTRATION")) != 0;
     mu_.lock();
     auto it = senders_.find(id);
     if (it != senders_.end()) {
@@ -185,6 +188,11 @@ class ZMQVan : public Van {
     }
     std::lock_guard<std::mutex> lk(mu_);
     senders_[id] = sender;
+    if (node_debug) {
+      LOG(INFO) << "BytePS ZMQ connected sender to node id=" << id
+                << " addr=" << addr << " my_node=" << my_node_.DebugString()
+                << " target=" << node.DebugString();
+    }
     PS_VLOG(3) << "Zmq Connected to: " << node.DebugString();
   }
 
@@ -297,6 +305,25 @@ class ZMQVan : public Van {
 
     auto it = senders_.find(id);
     if (it == senders_.end()) {
+      std::ostringstream senders;
+      senders << "[";
+      bool first = true;
+      for (const auto& entry : senders_) {
+        if (!first) senders << ", ";
+        senders << entry.first;
+        first = false;
+      }
+      senders << "]";
+      if (is_scheduler_ && !msg.meta.control.empty() &&
+          msg.meta.control.cmd == Control::ADD_NODE) {
+        LOG(WARNING) << "there is no socket to node " << id
+                     << " for scheduler ADD_NODE. current senders="
+                     << senders.str() << " msg=" << msg.DebugString();
+        return -1;
+      }
+      LOG(ERROR) << "there is no socket to node " << id
+                 << ". current senders=" << senders.str()
+                 << " msg=" << msg.DebugString();
       LOG(FATAL) << "there is no socket to node " << id;
       return -1;
     }

@@ -167,6 +167,15 @@ PY
 终端 1，启动 scheduler：
 
 ```bash
+pkill -f "byteps.server" || true
+pkill -f "bpslaunch" || true
+pkill -f "sglang.launch_server" || true
+pkill -f "sglang.srt" || true
+rm -rf /tmp/byteps_socket
+mkdir -p /tmp/byteps_socket
+```
+
+```bash
 cd /tmp
 conda activate sgl-dev2
 export DMLC_NUM_WORKER=1
@@ -178,6 +187,8 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 export DMLC_ROLE=scheduler
 bpslaunch
@@ -197,6 +208,8 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 export DMLC_ROLE=server
 bpslaunch
@@ -552,6 +565,8 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 export DMLC_ROLE=scheduler
 bpslaunch
@@ -571,6 +586,8 @@ export BYTEPS_KEY_HASH_FN=raw
 export BYTEPS_PUSH_THREAD=1
 export BYTEPS_LOG_LEVEL=INFO
 export DMLC_ENABLE_RDMA=0
+export DMLC_INTERFACE=lo
+export DMLC_NODE_HOST=127.0.0.1
 export DMLC_USE_GDR=0
 export DMLC_ROLE=server
 bpslaunch

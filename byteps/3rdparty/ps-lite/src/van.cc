@@ -31,6 +31,33 @@
 
 namespace ps {
 
+namespace {
+
+bool BytePSNodeDebugEnabled() {
+  const char* val = getenv("BYTEPS_DEBUG_NODE_REGISTRATION");
+  return val && atoi(val) != 0;
+}
+
+std::string NodeListDebugString(const std::vector<Node>& nodes) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (i) os << ", ";
+    os << nodes[i].DebugString();
+  }
+  os << "]";
+  return os.str();
+}
+
+const Node* FindNodeById(const std::vector<Node>& nodes, int id) {
+  for (const auto& node : nodes) {
+    if (node.id == id) return &node;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 // interval in second between to heartbeast signals. 0 means no heartbeat.
 // don't send heartbeast in default. because if the scheduler received a
 // heartbeart signal from a node before connected to that node, then it could be
@@ -118,6 +145,13 @@ void Van::ProcessAddNodeCommandAtScheduler(Message *msg, Meta *nodes,
   // consider all worker and server instances
   size_t num_nodes =
       postoffice_->num_server_instances() + postoffice_->num_worker_instances();
+  if (BytePSNodeDebugEnabled()) {
+    LOG(INFO) << "BytePS scheduler received ADD_NODE from sender="
+              << msg->meta.sender << " collected_nodes="
+              << nodes->control.node.size() << " expected_nodes=" << num_nodes
+              << " incoming_nodes=" << NodeListDebugString(msg->meta.control.node)
+              << " collected=" << NodeListDebugString(nodes->control.node);
+  }
   if (nodes->control.node.size() == num_nodes) {
     bool mixed_mode = getenv("BYTEPS_ENABLE_MIXED_MODE")
                           ? atoi(getenv("BYTEPS_ENABLE_MIXED_MODE"))
@@ -250,7 +284,12 @@ void Van::ProcessAddNodeCommandAtScheduler(Message *msg, Meta *nodes,
       }
       if (connected_nodes_.find(node_host_ip) == connected_nodes_.end()) {
         CHECK_EQ(node.id, Node::kEmpty);
-        PS_VLOG(1) << "assign id=" << id << " to node " << node.DebugString();
+        if (BytePSNodeDebugEnabled()) {
+          LOG(INFO) << "BytePS scheduler assigning id=" << id << " to node "
+                    << node.DebugString();
+        } else {
+          PS_VLOG(1) << "assign id=" << id << " to node " << node.DebugString();
+        }
         node.id = id;
         Connect(node);
         postoffice_->UpdateHeartbeat(node.id, t);
@@ -266,17 +305,36 @@ void Van::ProcessAddNodeCommandAtScheduler(Message *msg, Meta *nodes,
     nodes->control.cmd = Control::ADD_NODE;
     Message back;
     back.meta = *nodes;
+    bool broadcast_complete = true;
     for (int r : postoffice_->GetNodeIDs(kWorkerGroup + kServerGroup)) {
       int recver_id = r;
       if (shared_node_mapping_.find(r) == shared_node_mapping_.end()) {
+        const Node* node = FindNodeById(nodes->control.node, recver_id);
+        if (node) {
+          Connect(*node);
+        } else {
+          LOG(WARNING) << "BytePS scheduler cannot find node " << recver_id
+                       << " before ADD_NODE broadcast. nodes="
+                       << NodeListDebugString(nodes->control.node);
+        }
         back.meta.recver = recver_id;
         back.meta.timestamp = timestamp_++;
-        Send(back);
+        int sent = Send(back);
+        if (sent <= 0) {
+          broadcast_complete = false;
+          LOG(WARNING) << "BytePS scheduler skipped ADD_NODE broadcast to node "
+                       << recver_id << ". nodes="
+                       << NodeListDebugString(nodes->control.node);
+        }
       }
     }
     PS_VLOG(1) << "The scheduler is connected to " << num_workers_
                << " workers and " << num_servers_ << " servers";
-    ready_ = true;
+    ready_ = broadcast_complete;
+    if (!broadcast_complete) {
+      LOG(WARNING) << "BytePS scheduler delayed readiness because ADD_NODE "
+                      "broadcast did not reach every node";
+    }
   } else if (!recovery_nodes->control.node.empty()) {
     auto dead_nodes = postoffice_->GetDeadNodes(heartbeat_timeout_);
     std::unordered_set<int> dead_set(dead_nodes.begin(), dead_nodes.end());
@@ -581,8 +639,9 @@ void Van::Start(int customer_id, bool standalone) {
     PS_VLOG(1) << "Bind to " << my_node_.DebugString();
     CHECK_NE(my_node_.port, -1) << "bind failed";
 
-    // The scheduler does not need a loopback RDMA connection to itself.
-    if (!is_scheduler_) {
+    // The ZMQ scheduler still needs a loopback connection so RequestLocalStop()
+    // can wake its receiver thread with a local TERMINATE message.
+    if (!is_scheduler_ || GetType() == "zeromq") {
       Connect(scheduler_);
     }
 
@@ -694,6 +753,13 @@ int Van::Send(Message &msg) {
   }
 
   int send_bytes = SendMsg(msg);
+  if (send_bytes == -1 && is_scheduler_ && !msg.meta.control.empty() &&
+      msg.meta.control.cmd == Control::ADD_NODE) {
+    LOG(WARNING) << this->GetType()
+                 << " skipped ADD_NODE to node without a live connection: "
+                 << msg.DebugString();
+    return 0;
+  }
   CHECK_NE(send_bytes, -1) << this->GetType() << " sent -1 bytes";
   send_bytes_ += send_bytes;
   if (resender_) resender_->AddOutgoing(msg);

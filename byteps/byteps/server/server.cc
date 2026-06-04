@@ -150,6 +150,10 @@ void BytePSServerEngineThread(int i) {
     CHECK(msg.src);
     CHECK(msg.state);
     auto state = msg.state;
+    if ((msg.ops == COPY_FIRST || msg.ops == SUM_RECV) &&
+        msg.sarray.vals.size() > 0) {
+      msg.src = reinterpret_cast<void*>(msg.sarray.vals.data());
+    }
     logger_.record_event("engine thread preprocess begin.");
     common::compressor::Compressor* compressor = nullptr;
     {
@@ -547,6 +551,18 @@ void init_global_env() {
 
 extern "C" void byteps_server() {
   init_global_env();
+
+  if (!is_server_) {
+    LOG(INFO) << "Starting BytePS scheduler without server engine/KVServer";
+    ps::StartPS(0, role_, preferred_rank, true, "byteps\0");
+    if (!Postoffice::Get()->is_recovery()) {
+      Postoffice::Get()->Barrier(
+          0, ps::kWorkerGroup + ps::kServerGroup + ps::kScheduler);
+    }
+    Finalize(0, role_, true);
+    LOG(INFO) << "byteps scheduler has been shutdown";
+    return;
+  }
 
   // cpu reducer
   bps_reducer_ = new byteps::common::CpuReducer(nullptr);
