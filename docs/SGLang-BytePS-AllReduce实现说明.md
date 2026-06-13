@@ -2,32 +2,32 @@
 
 ## 状态
 
-已实现第一阶段代码改动，包含 TP 多 rank 初始化修复和跨 batch size 的 BytePS tensor name 隔离修复。Qwen2.5-0.5B-Instruct `--tp-size 2` + `--use-byteps-all-reduce` 端到端推理验证通过。当前改动只覆盖 SGLang 模型计算主路径 All-Reduce。
+已实现第一阶段代码改动，包含 TP 多 rank 初始化修复、跨 batch size 的 BytePS tensor name 隔离修复、以及**跨机多节点 BytePS RDMA 支持**。Qwen2.5-0.5B-Instruct `--tp-size 2` + `--use-byteps-all-reduce` 单机端到端推理验证通过；Qwen3-32B `--tp-size 4 --nnodes 2` 跨机 RDMA（ibverbs）端到端推理验证通过。当前改动只覆盖 SGLang 模型计算主路径 All-Reduce。
 
 ## 日期
 
-2026-06-04
+2026-06-13
 
 ## 变更范围
 
 本轮为 `sglang-0.5.10.post1` 增加一个显式开启的 BytePS All-Reduce 路径。开关关闭时，SGLang 原有通信路径保持不变；开关开启后，模型主路径经 `GroupCoordinator.all_reduce()` 进入 BytePS，不允许静默退回 custom All-Reduce、PyNccl、MSCCLPP、TorchSymmMem 或 `torch.distributed.all_reduce()`。
 
-第一阶段只处理这些内容：
+当前处理的场景：
 
 - 替换模型计算主路径 All-Reduce。
 - 保留 scheduler、cache、speculative 等控制面中直接调用的 `torch.distributed.all_reduce()`。
 - 保留 reduce-scatter、all-gather、broadcast、send/recv。
 - 不实现 CUDA graph capture 支持。遇到 CUDA graph 或 piecewise CUDA graph 时直接报错。
-- 首测拓扑按单机多 GPU 设计。
+- 支持单机多 GPU 和**跨机多节点**两种拓扑。跨机使用 BytePS ibverbs（RDMA）传输。
 - 不使用外层 `bpslaunch` 包 SGLang server，而是在 SGLang model worker 内设置 BytePS local env 并初始化 BytePS。
 
 ## 修改文件
 
 | 文件 | 修改内容 |
 | --- | --- |
-| `sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py` | 新增 BytePS wrapper，包含幂等初始化、declare 缓存、group name 构造、`push_pull_async_inplace + synchronize`。 |
-| `sglang-0.5.10.post1/python/sglang/srt/server_args.py` | 新增 `use_byteps_all_reduce`、`byteps_all_reduce_debug` 字段和对应 CLI 参数。 |
-| `sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py` | 在 model worker 分布式初始化流程中设置 BytePS local env、初始化 BytePS，并调用 `set_byteps_all_reduce(...)`。 |
+| `sglang-0.5.10.post1/python/sglang/srt/distributed/byteps_collectives.py` | 新增 BytePS wrapper，包含幂等初始化、declare 缓存、group name 构造、`push_pull_async_inplace + synchronize`。支持单机和跨机两种模式（通过 `nnodes`/`node_rank` 参数）。 |
+| `sglang-0.5.10.post1/python/sglang/srt/server_args.py` | 新增 `use_byteps_all_reduce`、`byteps_all_reduce_debug` 字段和对应 CLI 参数。跨机模式复用已有的 `--nnodes`、`--node-rank`、`--dist-init-addr`。 |
+| `sglang-0.5.10.post1/python/sglang/srt/model_executor/model_runner.py` | 在 model worker 分布式初始化流程中设置 BytePS local env、初始化 BytePS，并调用 `set_byteps_all_reduce(...)`。跨机模式下根据 `nnodes` 计算本机 GPU 数（`tp_size // nnodes`）作为 `BYTEPS_LOCAL_SIZE`，传递 `nnodes` 和 `node_rank` 给 BytePS wrapper。 |
 | `sglang-0.5.10.post1/python/sglang/srt/distributed/parallel_state.py` | 新增 BytePS 全局开关；`GroupCoordinator.all_reduce()` 增加 `logical_name` 参数；开启 BytePS 后执行强制 BytePS 路由和错误检查。 |
 | `sglang-0.5.10.post1/python/sglang/srt/distributed/communication_op.py` | TP、attention TP、MoE All-Reduce wrapper 增加可选 `logical_name` 参数。 |
 | `sglang-0.5.10.post1/python/sglang/srt/layers/linear.py` | `RowParallelLinear` 主路径 All-Reduce 传递稳定 BytePS logical name。 |
@@ -63,14 +63,15 @@ set_torch_symm_mem_all_reduce(...)
 set_byteps_all_reduce(False)
 
 如果开启 --use-byteps-all-reduce:
+    gpus_per_node = max(1, tp_size // nnodes)
     设置 BYTEPS_LOCAL_RANK = gpu_id
-    设置 BYTEPS_LOCAL_SIZE = tp_size * pp_size
+    设置 BYTEPS_LOCAL_SIZE = gpus_per_node * pp_size
 
 init_distributed_environment(...)
 initialize_model_parallel(...)
 
 如果开启 --use-byteps-all-reduce:
-    initialize_byteps_for_sglang(...)
+    initialize_byteps_for_sglang(local_rank, local_size, nnodes, node_rank, debug)
     set_byteps_all_reduce(True, debug=...)
 ```
 
@@ -80,18 +81,20 @@ initialize_model_parallel(...)
 BYTEPS_LOCAL_RANK
 BYTEPS_LOCAL_SIZE
 DMLC_ROLE=worker
-DMLC_NUM_WORKER=1
-DMLC_WORKER_ID=0
+DMLC_NUM_WORKER=str(nnodes)     # 单机=1, 双机=2
+DMLC_WORKER_ID=str(node_rank)   # gpu04=0, gpu03=1
 ```
 
 随后调用 `bps.init()`。该初始化是进程内幂等的，由 `_BPS_INITIALIZED` 保护。
 
-注意：`initialize_byteps_for_sglang()` **不会设置** `BYTEPS_SOCKET_PATH`、`DMLC_INTERFACE`、`DMLC_NODE_HOST`。在 ZMQ 通信路径下，`BYTEPS_SOCKET_PATH`（通常设为 `/tmp/byteps_socket`）是必需的；本地 loopback 测试时，`DMLC_INTERFACE=lo` 和 `DMLC_NODE_HOST=127.0.0.1` 也应在启动 SGLang 前由外部显式设置。
+注意：`initialize_byteps_for_sglang()` **不会设置** `BYTEPS_SOCKET_PATH`、`DMLC_INTERFACE`、`DMLC_NODE_HOST`、`DMLC_PS_ROOT_URI`、`DMLC_PS_ROOT_PORT`、`DMLC_ENABLE_RDMA`。这些变量应在启动 SGLang 前由外部显式设置。
 
 初始化后会校验：
 
 - `bps.local_rank()` 是否等于当前 SGLang worker 的 `gpu_id`。
-- `bps.local_size()` 是否等于 `tp_size * pp_size`。
+- `bps.local_size()` 是否等于 `gpus_per_node * pp_size`。
+
+**跨机关键约束**：`BYTEPS_LOCAL_SIZE` 必须是**本节点的 GPU 数**（即 `tp_size // nnodes`），不能是全局 TP size。跨机 tp=4、nnodes=2 时每节点只有 2 个 GPU，`BYTEPS_LOCAL_SIZE=2`；若误设为 4，BytePS root device 会等待 4 个本机进程调用 `bps.init()`，但只有 2 个存在，导致 non-root rank 永远 hang。
 
 当前代码没有设置 `DMLC_NUM_SERVER`，也没有校验 `bps.size()`。
 
@@ -120,25 +123,21 @@ bps.declare(name, expected_workers=expected_workers)
 `expected_workers` 的值通过 `_byteps_expected_workers()` 辅助函数计算：
 
 ```python
-def _byteps_expected_workers() -> int:
+_byteps_expected_workers() -> int:
+    if _BPS_NNODES > 1:
+        return _BPS_NNODES          # 多机：等于节点数 (2/4/8...)
     import byteps.torch as bps
-
     local_size = max(1, bps.local_size())
-    return max(1, bps.size() // local_size)
+    return max(1, bps.size() // local_size)  # 单机兜底
 ```
 
-该函数用 `max(1, ...)` 保护除零和空环境，确保在没有 BytePS root worker 的退化场景（如单 rank 测试）下也能正常声明 tensor。
+`_BPS_NNODES` 在 `initialize_byteps_for_sglang()` 中设置，值来自 `--nnodes`。
 
-这里的 `expected_workers` 是 BytePS PS server 等待的 worker 节点数，不是 SGLang TP group 的 rank 数。单机多 GPU 首测时：
+多机逻辑说明：BytePS server 等待的是**节点数**（每个节点由 root worker 代表向 server push）。跨机 tp=4、nnodes=2时，4 个 GPU 进程（每节点 2 个）调用 `byteps_allreduce_inplace`，但只有 2 个 root worker（每节点 1 个）向 server push。`expected_workers=2`。
 
-```text
-bps.size() = 2
-bps.local_size() = 2
-local_size = max(1, 2) = 2
-expected_workers = max(1, 2 // 2) = 1
-```
+单机逻辑说明：单机时 `bps.size()` 和 `bps.local_size()` 都等于 BYTEPS_LOCAL_SIZE，`expected_workers = N // N = 1`。这是因为单机只有一个 root worker。
 
-如果把 TP rank 数 `2` 传给 BytePS server，server 会等待两个 worker 节点的 push，但单机只有一个 BytePS root worker 会向 server push，导致 `push_pull_async_inplace + synchronize` 卡住。
+如果把 TP rank 数传为 `expected_workers`，server 会等待错误数量的 worker push，导致 `push_pull_async_inplace + synchronize` 卡住。
 
 调试模式下，`byteps_allreduce_inplace()` 会同时打印 `group_world_size`（SGLang TP group 的 rank 数）和 `expected_workers`（BytePS server 等待的 worker 节点数），方便排查 declaration 不匹配导致的 hang 问题。
 
@@ -215,8 +214,9 @@ bps_ops.synchronize(handle)
 | --- | --- |
 | `BYTEPS_DEBUG_NODE_REGISTRATION` | 设置为 1 时在 van.cc 和 zmq_van.h 输出更详细的节点注册日志。首次排障时建议开启。 |
 | `BYTEPS_SOCKET_PATH` | BytePS 本地 ZMQ socket 文件目录，建议设为 `/tmp/byteps_socket`。 |
-| `DMLC_INTERFACE` | 网络接口名，本地 loopback 测试设为 `lo`。 |
-| `DMLC_NODE_HOST` | 节点 IP 地址，本地 loopback 测试设为 `127.0.0.1`。 |
+| `DMLC_INTERFACE` | 网络接口名。单机 TCP 测试设为 `lo`，跨机 RDMA 设为 Mellanox 接口名（如 `ens39f1np1`）。 |
+| `DMLC_NODE_HOST` | 节点 IP 地址。单机 TCP 测试设为 `127.0.0.1`，跨机设为 RDMA 接口的 IP（如 `192.168.1.13`）。 |
+| `DMLC_ENABLE_RDMA` | 设为 `ibverbs` 启用 BytePS verbs RDMA 传输；不设置或设为 `0` 走 ZMQ/TCP。 |
 
 ## All-Reduce 路由
 
@@ -340,7 +340,7 @@ pre_warm_nccl and not use_byteps_all_reduce
 - all-gather。
 - broadcast。
 - send/recv。
-- BytePS 多机 worker/server 编排（虽已改进单机 scheduler/server 稳定性和调度器纯角色模式支持，但多机网络拓扑、故障恢复、跨节点 barrier 仍未覆盖）。
+- 多机故障恢复和自动 reconnection。
 - CUDA graph capture 支持。
 
 ## 静态检查
@@ -373,20 +373,22 @@ local_size: 1
 
 双 rank push/pull smoke test 通过：两个本地 rank 均以 `expected_workers=1` 完成 float16 tensor All-Reduce，求和结果 `[3.0, 3.0, ...]` 符合预期。
 
+已运行（2026-06-13）：
+
+- 单机 SGLang BytePS TCP/UCX 推理（Qwen2.5-0.5B, tp=2）
+- 跨机 SGLang BytePS RDMA 推理（Qwen3-32B, tp=4, nnodes=2, ibverbs）
+- NCCL vs BytePS TCP vs BytePS UCX 延迟对比 benchmark
+
 未运行：
 
-- SGLang server 启动。
-- BytePS 多 GPU 正确性测试。
-- SGLang 功能测试。
-- 集成测试。
 - CUDA graph / piecewise CUDA graph 实测。
+- 跨机多 Server（`DMLC_NUM_SERVER > 1`）场景。
 
 ## 后续建议
 
-- 首次功能验证使用单机多 GPU，并显式关闭 CUDA graph / piecewise CUDA graph。
-- 若目标模型触发 generic logical name，优先给具体调用点补稳定业务名。
-- 如果后续要支持多机，需要把 `DMLC_NUM_WORKER`、`DMLC_WORKER_ID`、server/scheduler 编排从单机默认值扩展为外部可配置。当前 scheduler/server 已在 `server.cc` 中支持调度器纯角色模式，但多机 worker 还需要对应的初始化参数注入和网络拓扑配置。
 - 如果后续引入或定位到 `quant_all_reduce()`，开启 BytePS 时应先显式报错，再考虑单独支持。
+- 若目标模型触发 generic logical name，优先给具体调用点补稳定业务名。
+- 跨机多 Server（`DMLC_NUM_SERVER > 1`）场景尚未验证。
 
 ## Bug 修复记录
 
@@ -434,9 +436,70 @@ name = build_byteps_group_name(
 
 每个新的 (logical_name, shape) 组合会首次触发 `bps.declare()`，后续相同 name+shape 直接从 `_DECLARED_BPS_GROUPS` 缓存命中。SGLang 推理的 batch size 种类有限（warmup prefill 的 6、decode 的 1 等），不会产生无限增长的声明。
 
-### 测试验证
+### Bug 3 — 跨机多节点 BytePS 初始化参数错误
 
-环境：单机 2×GPU，sgl-dev2 conda 环境，Qwen2.5-0.5B-Instruct，float16。
+以下三个子问题在 2026-06-13 的跨机双节点 tp=4 RDMA 测试中发现并修复。三者互相关联，均在 `byteps_collectives.py` 和 `model_runner.py` 中修复。
+
+**Bug 3a — `BYTEPS_LOCAL_SIZE` 使用了全局 TP size 而非本机 GPU 数**
+
+**现象**：跨机 tp=4、nnodes=2 时，gpu04 的两个 SGLang worker 只有 TP0 完成 `BytePS initialized`，TP1 卡在 `bps.init()` 中。
+
+**根因**：`model_runner.py` 中原代码 `os.environ.setdefault("BYTEPS_LOCAL_SIZE", str(self.tp_size * self.pp_size))` 将 `BYTEPS_LOCAL_SIZE` 设为 4。BytePS 的 root device 等待 4 个本机进程调用 `bps.init()`，但每个节点只有 2 个 GPU，TP1 的 init 永远等不到足够数量的同伴。
+
+**修复**：计算 `gpus_per_node = max(1, tp_size // nnodes)`，以 `gpus_per_node * pp_size` 作为 `BYTEPS_LOCAL_SIZE`。
+
+**Bug 3b — `DMLC_NUM_WORKER` 硬编码为 1**
+
+**现象**：BytePS scheduler 只等待 1 个 worker 注册。gpu03 的 root worker 发出注册请求后 scheduler 已完成 barrier，gpu03 的 init 永久等待。
+
+**根因**：`byteps_collectives.py` 中 `os.environ.setdefault("DMLC_NUM_WORKER", "1")` 硬编码为单机值。
+
+**修复**：`initialize_byteps_for_sglang()` 增加 `nnodes` 参数，以 `str(nnodes)` 设置 `DMLC_NUM_WORKER`。
+
+**Bug 3c — `DMLC_WORKER_ID` 始终为 0**
+
+**现象**：两个节点的 root worker 向 scheduler 注册时使用相同的 worker ID=0，scheduler 看到两个相同 ID 的 worker，节点注册冲突。
+
+**根因**：`byteps_collectives.py` 中 `os.environ.setdefault("DMLC_WORKER_ID", ...)` 默认值总是 `"0"`。
+
+**修复**：`initialize_byteps_for_sglang()` 增加 `node_rank` 参数，以 `str(node_rank)` 设置 `DMLC_WORKER_ID`。
+
+### 跨机 RDMA 端到端验证
+
+环境：双机各 2× NVIDIA RTX A6000，sgl-dev conda 环境，Qwen3-32B，float16，BytePS ibverbs RDMA via Mellanox ConnectX-6 Dx (mlx5_1 / ens39f1np1 / 192.168.1.x)。
+
+```bash
+# gpu04 (node_rank=0)
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-32B --tp-size 4 --nnodes 2 --node-rank 0 \
+  --dist-init-addr 192.168.1.13:25000 --host 0.0.0.0 --port 30000 \
+  --log-level info --dtype float16 \
+  --disable-custom-all-reduce --disable-cuda-graph --disable-piecewise-cuda-graph \
+  --enforce-disable-flashinfer-allreduce-fusion \
+  --use-byteps-all-reduce --byteps-all-reduce-debug
+
+# gpu03 (node_rank=1)
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-32B --tp-size 4 --nnodes 2 --node-rank 1 \
+  --dist-init-addr 192.168.1.13:25000 --host 0.0.0.0 --port 30001 \
+  --log-level info --dtype float16 \
+  --disable-custom-all-reduce --disable-cuda-graph --disable-piecewise-cuda-graph \
+  --enforce-disable-flashinfer-allreduce-fusion \
+  --use-byteps-all-reduce --byteps-all-reduce-debug
+```
+
+四个 TP rank 的 BytePS 初始化日志：
+```
+[TP0 gpu04] BytePS initialized for SGLang: rank=0 local_rank=0 size=4 local_size=2
+[TP1 gpu04] BytePS initialized for SGLang: rank=1 local_rank=1 size=4 local_size=2
+[TP2 gpu03] BytePS initialized for SGLang: rank=2 local_rank=0 size=4 local_size=2
+[TP3 gpu03] BytePS initialized for SGLang: rank=3 local_rank=1 size=4 local_size=2
+```
+
+- ✅ `size=4`（总进程数）、`local_size=2`（每节点 GPU 数）
+- ✅ `Creating Van: ibverbs`（BytePS scheduler/server/workers 均走 RDMA）
+- ✅ `expected_workers=2`（两节点各贡献一次 push）
+- ✅ 推理输出正确：`" Paris. What is"`
 
 ```bash
 # 启动命令

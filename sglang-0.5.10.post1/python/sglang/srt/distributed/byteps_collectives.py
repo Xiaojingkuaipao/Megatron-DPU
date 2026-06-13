@@ -9,20 +9,26 @@ logger = logging.getLogger(__name__)
 
 _BPS_INITIALIZED = False
 _BPS_DEBUG = False
+_BPS_NNODES = 1
 _DECLARED_BPS_GROUPS: Dict[str, int] = {}
 
 
 def initialize_byteps_for_sglang(
-    local_rank: int, local_size: int, debug: bool = False
+    local_rank: int,
+    local_size: int,
+    nnodes: int = 1,
+    node_rank: int = 0,
+    debug: bool = False,
 ) -> None:
-    global _BPS_INITIALIZED, _BPS_DEBUG
+    global _BPS_INITIALIZED, _BPS_DEBUG, _BPS_NNODES
 
     _BPS_DEBUG = debug
+    _BPS_NNODES = nnodes
     os.environ.setdefault("BYTEPS_LOCAL_RANK", str(local_rank))
     os.environ.setdefault("BYTEPS_LOCAL_SIZE", str(local_size))
     os.environ.setdefault("DMLC_ROLE", "worker")
-    os.environ.setdefault("DMLC_NUM_WORKER", "1")
-    os.environ.setdefault("DMLC_WORKER_ID", os.environ.get("DMLC_WORKER_ID", "0"))
+    os.environ.setdefault("DMLC_NUM_WORKER", str(nnodes))
+    os.environ.setdefault("DMLC_WORKER_ID", str(node_rank))
 
     import byteps.torch as bps
 
@@ -93,6 +99,8 @@ def declare_and_cache_byteps_group(name: str, expected_workers: int) -> None:
 
 
 def _byteps_expected_workers() -> int:
+    if _BPS_NNODES > 1:
+        return _BPS_NNODES
     import byteps.torch as bps
 
     local_size = max(1, bps.local_size())

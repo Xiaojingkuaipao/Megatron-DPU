@@ -944,9 +944,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "paths in phase 1. Disable flashinfer/AITER all-reduce fusion "
                     "before enabling BytePS All-Reduce."
                 )
+            gpus_per_node = max(1, self.server_args.tp_size // self.server_args.nnodes)
             os.environ.setdefault("BYTEPS_LOCAL_RANK", str(self.gpu_id))
             os.environ.setdefault(
-                "BYTEPS_LOCAL_SIZE", str(self.tp_size * self.pp_size)
+                "BYTEPS_LOCAL_SIZE", str(gpus_per_node * self.pp_size)
             )
 
         if not self.is_draft_worker:
@@ -992,9 +993,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     initialize_byteps_for_sglang,
                 )
 
+                gpus_per_node = max(1, self.server_args.tp_size // self.server_args.nnodes)
                 initialize_byteps_for_sglang(
                     local_rank=self.gpu_id,
-                    local_size=self.tp_size * self.pp_size,
+                    local_size=gpus_per_node * self.pp_size,
+                    nnodes=self.server_args.nnodes,
+                    node_rank=self.server_args.node_rank,
                     debug=self.server_args.byteps_all_reduce_debug,
                 )
                 set_byteps_all_reduce(
